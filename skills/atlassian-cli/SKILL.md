@@ -26,6 +26,20 @@ venv, no daemon, ~90 ms + network per call, zero resident memory between calls.
 Credentials: `~/.atl.json` (mode 600). The token is read at call time, never printed,
 never passed as an argument.
 
+## Credentials
+
+Resolved at call time, first hit wins: `~/.atl.json` -> `ATL_TOKEN` -> `token_command`
+(a command that prints the token: 1Password, pass, Vault, OS keychain) ->
+`~/.jira-api-token` -> a legacy mcp-atlassian entry in `~/.claude.json`.
+
+`atl init` sets this up interactively; `atl init --scoped` configures a scoped token,
+which requires routing through `api.atlassian.com` via a cloud id.
+
+**Never print the token, never pass it as a command argument, never paste it anywhere.**
+If a run warns that the config is world-readable, tell the user to `chmod 600 ~/.atl.json`
+rather than ignoring it. Tokens are created and revoked at
+https://id.atlassian.com/manage-profile/security/api-tokens
+
 ## Output contract
 
 Default output is compact lines meant to be read directly. `--json` gives the raw API

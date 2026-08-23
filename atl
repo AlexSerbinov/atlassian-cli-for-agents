@@ -98,8 +98,14 @@ def load_creds():
     out.setdefault("url", os.environ.get("ATL_URL", ""))
     out.setdefault("user", os.environ.get("ATL_USER", ""))
 
+    if os.path.exists(ATL_CONFIG):
+        _warn_if_world_readable(ATL_CONFIG)
+
     if not out.get("token"):
         out["token"] = os.environ.get("ATL_TOKEN", "")
+
+    if not out.get("token") and out.get("token_command"):
+        out["token"] = _read_token_command(out["token_command"])
 
     if not out.get("token") and os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE) as f:
@@ -122,7 +128,59 @@ def load_creds():
     if not out.get("confluence_url"):
         out["confluence_url"] = out["url"] + "/wiki"
     out["confluence_url"] = out["confluence_url"].rstrip("/")
+
+    # `site` is where humans go (browse links). `url` is where the API calls go,
+    # which differs once a cloud id sends us through the api.atlassian.com
+    # gateway — the only endpoint scoped API tokens are allowed to use.
+    out["site"] = out["url"]
+    out["site_wiki"] = out["confluence_url"]
+    if out.get("cloud_id"):
+        gw = "https://api.atlassian.com/ex"
+        out["url"] = f"{gw}/jira/{out['cloud_id']}"
+        out["confluence_url"] = f"{gw}/confluence/{out['cloud_id']}/wiki"
     return out
+
+
+def _read_token_command(cmd):
+    """Run a user-supplied command and take its stdout as the token.
+
+    This is the hook for password managers: 1Password, pass, gopass, Vault, or
+    the OS keychain. The token travels on a pipe, never on a command line, and
+    atl never sees where it is stored.
+    """
+    import subprocess
+
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"atl: token_command failed to run: {e}")
+    if res.returncode != 0:
+        err = res.stderr.decode("utf-8", "replace").strip()[:300]
+        sys.exit(f"atl: token_command exited {res.returncode}: {err}")
+    token = res.stdout.decode("utf-8", "replace").strip()
+    if not token:
+        sys.exit("atl: token_command produced no output")
+    return token
+
+
+def _warn_if_world_readable(path):
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        print(f"atl: warning — {path} is readable by other users "
+              f"(mode {oct(mode & 0o777)}). Run: chmod 600 {path}", file=sys.stderr)
+
+
+def discover_cloud_id(site_url):
+    """The site's cloud id, needed for scoped tokens. Public, no auth."""
+    url = site_url.rstrip("/") + "/_edge/tenant_info"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            return json.load(r).get("cloudId")
+    except Exception:
+        return None
 
 
 def resolve_sprint_field(creds):
@@ -745,8 +803,24 @@ def resolve_account(creds, who):
 BRIEF_FIELDS = "summary,status,assignee,issuetype,priority,parent,duedate,timetracking"
 
 
-def cmd_init(_creds_unused, a):
-    """Write ~/.atl.json interactively. Never echoes the token."""
+TOKEN_URL = "https://id.atlassian.com/manage-profile/security/api-tokens"
+
+
+def _keychain_recipe(user):
+    """A `token_command` for the OS keychain, if this platform has one."""
+    if sys.platform == "darwin":
+        return (f"security find-generic-password -s atl -a {user} -w",
+                f"security add-generic-password -U -s atl -a {user} -w 'YOUR_TOKEN'",
+                "macOS Keychain")
+    if sys.platform.startswith("linux"):
+        return (f"secret-tool lookup service atl account {user}",
+                f"secret-tool store --label='atl' service atl account {user}",
+                "GNOME Keyring / libsecret")
+    return None
+
+
+def cmd_init(_unused, a):
+    """Write ~/.atl.json interactively. The token is never echoed."""
     import getpass
 
     existing = {}
@@ -761,21 +835,58 @@ def cmd_init(_creds_unused, a):
 
     def ask(prompt, default=""):
         shown = f" [{default}]" if default else ""
-        got = input(f"{prompt}{shown}: ").strip()
-        return got or default
+        return input(f"{prompt}{shown}: ").strip() or default
 
-    print("Create an API token at "
-          "https://id.atlassian.com/manage-profile/security/api-tokens\n")
+    print("atl setup\n")
+    print("1. Open " + TOKEN_URL)
+    print("2. Create API token  ->  name it 'atl', pick an expiry")
+    print("3. Copy it now — Atlassian will not show it again\n")
+    print("   Use a CLASSIC token (the plain 'Create API token' button).")
+    print("   Scoped tokens work too but need a cloud id; see --scoped below.\n")
+
     url = ask("Site URL (https://you.atlassian.net)", existing.get("url", ""))
     user = ask("Account email", existing.get("user", ""))
-    token = getpass.getpass("API token (input hidden): ").strip() \
-        or existing.get("token", "")
-    if not (url and user and token):
-        sys.exit("atl: url, user and token are all required")
-
+    if not (url and user):
+        sys.exit("atl: site URL and email are both required")
     url = url.rstrip("/")
-    cfg = {"url": url, "user": user, "token": token,
-           "confluence_url": ask("Confluence base URL", url + "/wiki").rstrip("/")}
+
+    cfg = {"url": url, "user": user}
+    wiki = ask("Confluence base URL", (existing.get("site_wiki") or url + "/wiki"))
+    if wiki.rstrip("/") != url + "/wiki":
+        cfg["confluence_url"] = wiki.rstrip("/")
+
+    if a.scoped:
+        cid = discover_cloud_id(url)
+        if not cid:
+            sys.exit(f"atl: could not read the cloud id from {url}/_edge/tenant_info; "
+                     "pass it manually as \"cloud_id\" in " + ATL_CONFIG)
+        cfg["cloud_id"] = cid
+        print(f"\ncloud id: {cid}  (calls will go through api.atlassian.com)")
+
+    # --- where the token lives -------------------------------------------
+    kc = _keychain_recipe(user)
+    print("\nWhere should the token be stored?")
+    print("  1) a command (password manager: 1Password, pass, gopass, Vault) — most secure")
+    if kc:
+        print(f"  2) {kc[2]}")
+    print(f"  {'3' if kc else '2'}) {ATL_CONFIG}, mode 600 — simplest")
+    choice = ask("Choice", "3" if kc else "2")
+
+    if choice == "1":
+        cmd = ask("Command that prints the token on stdout")
+        if not cmd:
+            sys.exit("atl: no command given")
+        cfg["token_command"] = cmd
+    elif kc and choice == "2":
+        cfg["token_command"] = kc[0]
+        print(f"\nStore the token once with:\n  {kc[1]}")
+        if sys.platform == "darwin":
+            print("  (or add it by hand in Keychain Access, service 'atl')")
+    else:
+        token = getpass.getpass("API token (input hidden): ").strip()
+        if not token:
+            sys.exit("atl: no token given")
+        cfg["token"] = token
 
     tmp = ATL_CONFIG + ".tmp"
     with open(tmp, "w") as f:
@@ -784,11 +895,16 @@ def cmd_init(_creds_unused, a):
     os.replace(tmp, ATL_CONFIG)
     print(f"\nwrote {ATL_CONFIG} (mode 600)")
 
+    if "token" not in cfg and cfg.get("token_command"):
+        print("Once the token is in place, check it with:  atl me")
+        return
     try:
-        who = api(cfg, "/rest/api/3/myself")
+        who = api(load_creds(), "/rest/api/3/myself")
         print(f"authenticated as {who.get('displayName')} <{who.get('emailAddress')}>")
     except ApiError as e:
-        print(f"warning: credentials written but the check call failed — {e.status}")
+        print(f"warning: config written, but the check call failed — HTTP {e.status}")
+        if e.status == 401:
+            print("  401 usually means the token was copied incomplete, or it expired.")
 
 
 def cmd_me(creds, a):
@@ -797,7 +913,7 @@ def cmd_me(creds, a):
         return out_json(u)
     print(f"{u.get('displayName')} <{u.get('emailAddress')}>")
     print(f"accountId: {u.get('accountId')}")
-    print(f"site:      {creds['url']}")
+    print(f"site:      {creds['site']}")
 
 
 def _issue_line(i):
@@ -829,7 +945,7 @@ def cmd_issue(creds, a):
     if tt:
         print(f"  time:     spent {tt.get('timeSpent', '0')}"
               f"  est {tt.get('originalEstimate', '—')}")
-    print(f"  url:      {creds['url']}/browse/{i['key']}")
+    print(f"  url:      {creds['site']}/browse/{i['key']}")
     desc = adf_to_md(f.get("description")).strip()
     if desc:
         print("\n--- description ---")
@@ -960,7 +1076,7 @@ def cmd_create(creds, a):
 
     if a.json:
         return out_json(res)
-    print(f"{res['key']}  {creds['url']}/browse/{res['key']}")
+    print(f"{res['key']}  {creds['site']}/browse/{res['key']}")
 
 
 def _coerce(v):
@@ -1327,7 +1443,7 @@ def cmd_conf_get(creds, a):
         print(f"title:   {p['title']}")
         print(f"space:   {p.get('spaceId')}")
         print(f"version: {p.get('version', {}).get('number')}")
-        print(f"url:     {creds['confluence_url']}/spaces/_/pages/{p['id']}")
+        print(f"url:     {creds['site_wiki']}/spaces/_/pages/{p['id']}")
         return
     print(f"# {p['title']}\n")
     print(adf_to_md(doc).strip())
@@ -1389,7 +1505,7 @@ def cmd_conf_create(creds, a):
                 "body": {"representation": "atlas_doc_format",
                          "value": json.dumps(doc)}})
 
-    print(f"{res['id']}  {creds['confluence_url']}{res['_links']['webui']}")
+    print(f"{res['id']}  {creds['site_wiki']}{res['_links']['webui']}")
 
 
 def cmd_conf_search(creds, a):
@@ -1649,6 +1765,8 @@ def build_parser():
 
     s = add("init", cmd_init, "write ~/.atl.json interactively")
     s.add_argument("--force", action="store_true", help="overwrite an existing config")
+    s.add_argument("--scoped", action="store_true",
+                   help="use a scoped API token (routes calls via api.atlassian.com)")
 
     add("me", cmd_me, "who the token belongs to")
 

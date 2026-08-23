@@ -359,6 +359,123 @@ class Credentials(unittest.TestCase):
             atl.load_creds()
 
 
+class TokenStorage(unittest.TestCase):
+    """Four places a token may come from, in priority order."""
+
+    def setUp(self):
+        self._saved = (atl.ATL_CONFIG, atl.TOKEN_FILE, atl.CLAUDE_CONFIG)
+        self._env = {k: os.environ.pop(k, None)
+                     for k in ("ATL_URL", "ATL_USER", "ATL_TOKEN")}
+        self.dir = tempfile.mkdtemp()
+        atl.ATL_CONFIG = os.path.join(self.dir, ".atl.json")
+        atl.TOKEN_FILE = os.path.join(self.dir, "no-token")
+        atl.CLAUDE_CONFIG = os.path.join(self.dir, "no-claude")
+
+    def tearDown(self):
+        atl.ATL_CONFIG, atl.TOKEN_FILE, atl.CLAUDE_CONFIG = self._saved
+        for k, v in self._env.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def write(self, **extra):
+        cfg = {"url": "https://x.atlassian.net", "user": "a@b.c"}
+        cfg.update(extra)
+        with open(atl.ATL_CONFIG, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(atl.ATL_CONFIG, 0o600)
+
+    def test_token_command_stdout_becomes_the_token(self):
+        self.write(token_command="printf 'from-manager'")
+        self.assertEqual(atl.load_creds()["token"], "from-manager")
+
+    def test_token_command_output_is_stripped(self):
+        self.write(token_command="printf 'padded\n'")
+        self.assertEqual(atl.load_creds()["token"], "padded")
+
+    def test_inline_token_beats_the_command(self):
+        self.write(token="inline", token_command="printf 'from-manager'")
+        self.assertEqual(atl.load_creds()["token"], "inline")
+
+    def test_env_beats_the_command(self):
+        os.environ["ATL_TOKEN"] = "from-env"
+        self.write(token_command="printf 'from-manager'")
+        self.assertEqual(atl.load_creds()["token"], "from-env")
+
+    def test_failing_command_exits_with_the_reason(self):
+        self.write(token_command="echo boom >&2; exit 7")
+        with self.assertRaises(SystemExit) as cm:
+            atl.load_creds()
+        self.assertIn("exited 7", str(cm.exception))
+
+    def test_silent_command_is_an_error_not_an_empty_token(self):
+        self.write(token_command="true")
+        with self.assertRaises(SystemExit) as cm:
+            atl.load_creds()
+        self.assertIn("no output", str(cm.exception))
+
+    def test_loose_permissions_warn_on_stderr(self):
+        import io
+        from contextlib import redirect_stderr
+        self.write(token="t")
+        os.chmod(atl.ATL_CONFIG, 0o644)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            atl.load_creds()
+        self.assertIn("readable by other users", err.getvalue())
+
+    def test_tight_permissions_are_silent(self):
+        import io
+        from contextlib import redirect_stderr
+        self.write(token="t")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            atl.load_creds()
+        self.assertEqual(err.getvalue(), "")
+
+
+class ScopedTokens(unittest.TestCase):
+    """A cloud id routes API calls through api.atlassian.com, which is the only
+    host scoped tokens may use — while human-facing links stay on the site."""
+
+    def setUp(self):
+        self._saved = (atl.ATL_CONFIG, atl.TOKEN_FILE, atl.CLAUDE_CONFIG)
+        self.dir = tempfile.mkdtemp()
+        atl.ATL_CONFIG = os.path.join(self.dir, ".atl.json")
+        atl.TOKEN_FILE = os.path.join(self.dir, "no-token")
+        atl.CLAUDE_CONFIG = os.path.join(self.dir, "no-claude")
+
+    def tearDown(self):
+        atl.ATL_CONFIG, atl.TOKEN_FILE, atl.CLAUDE_CONFIG = self._saved
+
+    def write(self, **extra):
+        cfg = {"url": "https://x.atlassian.net", "user": "a@b.c", "token": "t"}
+        cfg.update(extra)
+        with open(atl.ATL_CONFIG, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(atl.ATL_CONFIG, 0o600)
+
+    def test_without_cloud_id_everything_points_at_the_site(self):
+        self.write()
+        c = atl.load_creds()
+        self.assertEqual(c["url"], "https://x.atlassian.net")
+        self.assertEqual(c["site"], "https://x.atlassian.net")
+        self.assertEqual(c["confluence_url"], "https://x.atlassian.net/wiki")
+
+    def test_cloud_id_switches_the_api_host(self):
+        self.write(cloud_id="abc-123")
+        c = atl.load_creds()
+        self.assertEqual(c["url"], "https://api.atlassian.com/ex/jira/abc-123")
+        self.assertEqual(c["confluence_url"],
+                         "https://api.atlassian.com/ex/confluence/abc-123/wiki")
+
+    def test_browse_links_never_go_through_the_gateway(self):
+        self.write(cloud_id="abc-123")
+        c = atl.load_creds()
+        self.assertEqual(c["site"], "https://x.atlassian.net")
+        self.assertEqual(c["site_wiki"], "https://x.atlassian.net/wiki")
+        self.assertNotIn("api.atlassian.com", c["site"])
+
+
 class Parser(unittest.TestCase):
     def test_every_subcommand_parses(self):
         p = atl.build_parser()
@@ -455,6 +572,9 @@ class Secrets(unittest.TestCase):
                 continue
             for node in _ast.walk(fn):
                 if (isinstance(node, _ast.Subscript)
+                        # Load only: writing the token during `init` is fine,
+                        # reading it anywhere but the auth header is not.
+                        and isinstance(node.ctx, _ast.Load)
                         and subscript_key(node) == "token"
                         and isinstance(node.value, _ast.Name)
                         and node.value.id in ("creds", "cfg")):
@@ -466,11 +586,31 @@ class Secrets(unittest.TestCase):
         self.assertEqual(readers, {"_auth_header"},
                          f"token is read outside the auth header: {sorted(readers)}")
 
-    def test_no_credentials_in_argv_construction(self):
+    def test_token_command_never_receives_the_token(self):
+        """atl runs a user's password-manager command and reads stdout. It must
+        never build a command line that contains the secret."""
+        import ast as _ast
+
+        with open(os.path.join(HERE, os.pardir, "atl")) as f:
+            tree = _ast.parse(f.read())
+
+        runners = []
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, _ast.FunctionDef):
+                continue
+            for node in _ast.walk(fn):
+                if (isinstance(node, _ast.Attribute) and node.attr == "run"
+                        and isinstance(node.value, _ast.Name)
+                        and node.value.id == "subprocess"):
+                    runners.append(fn.name)
+        self.assertEqual(runners, ["_read_token_command"],
+                         f"unexpected subprocess use in {runners}")
+
+    def test_no_shell_out_to_os_system(self):
         with open(os.path.join(HERE, os.pardir, "atl")) as f:
             src = f.read()
-        self.assertNotIn("subprocess", src)
         self.assertNotIn("os.system", src)
+        self.assertNotIn("os.popen", src)
 
     def test_auth_header_is_basic(self):
         h = atl._auth_header({"user": "a@b.c", "token": "secret"})

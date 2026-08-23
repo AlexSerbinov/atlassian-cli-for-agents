@@ -201,17 +201,61 @@ curl -fsSL https://raw.githubusercontent.com/AlexSerbinov/atlassian-cli-for-agen
 pip install atl-cli
 ```
 
+### Get a token
+
+1. Open **[id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)**
+   — or: your avatar → **Manage account** → **Security** → **Create and manage API tokens**.
+2. **Create API token**, label it `atl`, pick an expiry (1 day – 1 year).
+3. **Copy it now.** Atlassian shows it exactly once and cannot show it again.
+
+### Point atl at it
+
 ```bash
-atl init    # prompts for site, email, API token → ~/.atl.json (mode 600)
+atl init    # asks for site, email, and where to keep the token
 atl me      # verify
 ```
 
-Get a token at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+```console
+$ atl me
+Jane Doe <jane@acme.com>
+accountId: 557058:1a2b3c4d-…
+site:      https://acme.atlassian.net
+```
+
+### Keep it somewhere sensible
+
+An API token does everything your account can, in every project you can see. `atl` never
+requires you to store it in a file it owns — point it at your password manager instead:
+
+```json
+{
+  "url": "https://acme.atlassian.net",
+  "user": "jane@acme.com",
+  "token_command": "op read op://Private/atl/credential"
+}
+```
+
+Anything that prints the token on stdout works — 1Password, `pass`, gopass, Vault, macOS
+Keychain, GNOME Keyring. `atl` runs it, reads the output, and never learns where the secret
+actually lives. `atl init` writes the keychain recipe for your platform for you.
+
+The plain `"token": "…"` form still works and is written mode `600`; `atl` re-checks those
+permissions on every run and warns if the file becomes readable by others. For CI, use
+`ATL_URL` / `ATL_USER` / `ATL_TOKEN` and a
+[service account](https://support.atlassian.com/user-management/docs/manage-api-tokens-for-service-accounts/).
+
+Resolution order: `~/.atl.json` → `ATL_TOKEN` → `token_command` → `~/.jira-api-token` → a legacy mcp-atlassian entry.
 
 > [!TIP]
 > **Coming from mcp-atlassian?** Skip `atl init` entirely. If the `atlassian` server is still in your `~/.claude.json`, `atl` reads those credentials directly and works with **zero configuration**. Remove the server once you are satisfied.
 
-Resolution order: `~/.atl.json` → `ATL_URL`/`ATL_USER`/`ATL_TOKEN` → `~/.jira-api-token` → the legacy MCP config.
+> [!NOTE]
+> Want least privilege? Atlassian's **scoped** tokens work too, but they are only valid
+> against `api.atlassian.com`. Run `atl init --scoped` — it reads your site's cloud id and
+> routes API calls through the gateway while keeping browse links on your site.
+
+🔐 **[Full setup and token-storage guide →](docs/setup.md)** — step by step, every storage
+option with copy-paste recipes, scoped-token scopes, and a troubleshooting table.
 
 ---
 
@@ -388,10 +432,10 @@ Adding a command is three edits: a `cmd_*(creds, a)` function, a block in `build
 ### Tests
 
 ```bash
-python -m unittest discover -s tests -v      # 51 tests, no network, no credentials
+python -m unittest discover -s tests -v      # 63 tests, no network, no credentials
 ```
 
-They cover the Markdown-image pipeline (parse, strip, rewrite, remote-URL and missing-file fallbacks), the ADF converter in both directions — including the ADF invariant that a text node may never be empty — round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources, error unwrapping for **both** the Jira (`errors` as an object) and Confluence (`errors` as a list) shapes, and the token rule above.
+They cover the Markdown-image pipeline (parse, strip, rewrite, remote-URL and missing-file fallbacks), the ADF converter in both directions — including the ADF invariant that a text node may never be empty — round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources including `token_command` failure modes, the config-permission warning, scoped-token gateway routing, error unwrapping for **both** the Jira (`errors` as an object) and Confluence (`errors` as a list) shapes, and the token rule above.
 
 CI runs them on Linux and macOS against Python 3.8, 3.11 and 3.13. Every write path was additionally exercised against a live Jira and Confluence Cloud site: create → comment → transition-with-comment → edit → worklog add/edit/delete → attach/download/delete → sprint add/backlog → assign, and page create → read → update → comment → reply → history → diff → label → delete.
 
