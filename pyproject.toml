@@ -23,8 +23,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/AlexSerbinov/atl"
-Issues = "https://github.com/AlexSerbinov/atl/issues"
+Homepage = "https://github.com/AlexSerbinov/atlassian-cli-for-agents"
+Issues = "https://github.com/AlexSerbinov/atlassian-cli-for-agents/issues"
 
 [project.scripts]
 atl = "atl:main"

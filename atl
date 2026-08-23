@@ -31,7 +31,7 @@ Run ``atl init`` to write ``~/.atl.json`` interactively.
 The token is read from disk at call time. It is never printed, never logged, and
 never passed as a command-line argument, so it does not show up in ``ps``.
 
-MIT licensed. https://github.com/AlexSerbinov/atl
+MIT licensed. https://github.com/AlexSerbinov/atlassian-cli-for-agents
 """
 
 __version__ = "0.1.0"

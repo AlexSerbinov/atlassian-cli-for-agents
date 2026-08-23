@@ -1,94 +1,149 @@
-# atl
+<div align="center">
 
-**Jira and Confluence Cloud from your shell — built for AI coding agents.**
+# `atl`
 
-A single-file, zero-dependency CLI that replaces the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server. Same operations, **5–25× fewer tokens**, no resident process, and it does three things the MCP server cannot do at all.
+### Jira + Confluence Cloud from your shell — built for AI coding agents
 
-[![tests](https://github.com/AlexSerbinov/atl/actions/workflows/test.yml/badge.svg)](https://github.com/AlexSerbinov/atl/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+**A single file. Zero dependencies. No daemon.**
+A drop-in replacement for the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server that puts **5–25× fewer tokens** in your model's context.
+
+[![tests](https://github.com/AlexSerbinov/atlassian-cli-for-agents/actions/workflows/test.yml/badge.svg)](https://github.com/AlexSerbinov/atlassian-cli-for-agents/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+[![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](pyproject.toml)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange.svg)](#contributing)
+
+</div>
+
+---
 
 ```console
-$ atl issue EA-1257
-EA-1257  Generated API types cannot be regenerated — minified DTO class names are unstable
+$ atl issue PROJ-1257
+PROJ-1257  Generated API types cannot be regenerated — minified DTO names are unstable
   status:   In testing   type: Task   prio: Medium
-  assignee: Alex Serbinov   reporter: Anna K.
+  assignee: Jane Doe     reporter: Alex M.
   labels:   backend, frontend, tech-debt
   time:     spent 30m  est —
-  url:      https://acme.atlassian.net/browse/EA-1257
+  url:      https://acme.atlassian.net/browse/PROJ-1257
 
 --- description ---
 ## Problem
-`npm run generate:admin` cannot be run. Regenerating the types produces a …
+`npm run generate:admin` cannot be run. Regenerating the types produces a
++5295 / −3307 diff and 117 `tsc` errors — not because the API changed …
 ```
 
-That is the whole response. The equivalent MCP call returns 56 KB of JSON, and your model pays for every byte of it.
+That is the entire response. The same call through an MCP server returns **56 KB of JSON**, and your model reads every byte.
+
+<div align="center">
+
+|  |  |
+|:--|:--|
+| 🪶 **One file, no dependencies** | 62 KB of stdlib Python. Vendor it, read it, patch it. |
+| ⚡ **No resident process** | Starts in ~90 ms, works, exits. Not 137 MB × every open tab. |
+| 📉 **5–25× fewer tokens** | The shell filters, not the model. |
+| 🔓 **Does what MCP can't** | Edit/delete worklogs, upload Jira attachments, transition **with** a comment. |
+| 🔐 **Token never hits `ps`** | Read from a 0600 file into one header. A test enforces it. |
+
+</div>
 
 ---
 
 ## Why this exists
 
-MCP is a good protocol for a lot of things. For a REST API that an agent calls dozens of times a day, it has three costs that compound:
+MCP is a fine protocol. For a REST API an agent hits dozens of times a day, it has three costs that compound.
 
-**1. Every response is raw JSON, and the model reads all of it.**
+### 1. Every response is raw JSON, and the model reads all of it
 
-A 20-issue search through mcp-atlassian returns 13.5 KB. The same search here returns 2.9 KB. The difference is not compression — it is that the MCP response repeats the same 200-character `avatar_url` on all twenty rows, for the same person, plus `id`, `self` links, and status colors nobody asked for. With a CLI, `jq`, `grep` and `head` do the filtering in the shell, and intermediate JSON never enters the context window at all.
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tokens-dark.svg">
+    <img alt="Bytes reaching the model per operation: atl vs mcp-atlassian" src="docs/assets/tokens-light.svg" width="100%">
+  </picture>
+</div>
 
-**2. One resident process per editor session.**
+The gap is not compression. Here is **one row** of a twenty-row MCP search result:
 
-mcp-atlassian is a Python daemon. Open ten terminal tabs with your agent and you have ten copies, ~137 MB each, sitting there whether or not you touch Jira that day.
+```json
+{
+  "id": "27714", "key": "PROJ-738",
+  "summary": "User message is not delivered to manager …",
+  "status": { "name": "Release branch", "category": "In Progress", "color": "yellow" },
+  "issue_type": { "name": "Bug" }, "priority": { "name": "High" },
+  "assignee": {
+    "display_name": "Jane Doe", "name": "Jane Doe", "email": "jane@acme.com",
+    "avatar_url": "https://avatar-management--avatars.us-west-2.prod.public.atl-paas.net/557058:1a2b…/aaaaaaaa-…/48"
+  }
+}
+```
 
-| | mcp-atlassian 0.21 | atl |
-|---|---|---|
-| 1 session | 137 MB | 0 MB |
-| 10 sessions | 1.4 GB | 0 MB |
-| 20 sessions | 2.7 GB | 0 MB |
+That `avatar_url` is 200 characters. It repeats **identically on all twenty rows**, for the same person. `atl` prints one line:
 
-`atl` starts in ~90 ms, does the call, and exits.
+```
+PROJ-738   Release branch  Bug   Jane Doe   User message is not delivered to manager …
+```
 
-**3. Tool schemas are not free.**
+With a CLI, `jq`, `grep` and `head` do the filtering in the shell — intermediate JSON never enters the context window at all.
 
-mcp-atlassian exposes **72 tools** (49 Jira + 23 Confluence). Their descriptions and parameter schemas total ~141 KB — roughly **35,000 tokens** if a client loads them all. Modern clients defer schemas and load them on demand, which helps, but you still pay ~700 tokens per tool the moment you use it. This README's companion `SKILL.md` is 9 KB — about 2,300 tokens, loaded once, and it documents all 46 commands.
+### 2. One resident daemon per editor session
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/memory-dark.svg">
+    <img alt="Resident memory by number of open agent sessions" src="docs/assets/memory-light.svg" width="100%">
+  </picture>
+</div>
+
+### 3. Tool schemas are not free
+
+mcp-atlassian exposes **72 tools**. Their descriptions and parameter schemas total ~141 KB — roughly **35,000 tokens** if a client loads them all. Clients that defer schemas pay only for what gets used, but that is still ~700 tokens per tool touched, plus the always-present list of 72 names.
+
+The agent guide shipped here is **9 KB ≈ 2,300 tokens**, loaded once, and documents all 46 commands.
 
 ---
 
-## Measured
+## The architectural difference in one picture
 
-Same site, same queries, same day. Compact `atl` output vs. what the model actually receives.
+```mermaid
+flowchart LR
+    subgraph MCP["MCP server"]
+        direction TB
+        A1["Agent"] -->|"JSON-RPC"| A2["resident daemon<br/>137 MB, one per session"]
+        A2 -->|"HTTPS"| A3["Atlassian API"]
+        A3 -->|"56 KB JSON"| A2
+        A2 -->|"56 KB into<br/>the context window"| A1
+    end
 
-| Operation | `atl` | mcp-atlassian / raw JSON | Reduction |
-|---|--:|--:|--:|
-| search, 20 issues | 2.9 KB | **13.5 KB** † | **4.6×** |
-| view one issue | 6.9 KB | 56 KB | 8.2× |
-| read comments | 5.1 KB | 43 KB | 8.4× |
-| list transitions | 0.9 KB | 14 KB | 15× |
-| list worklogs | 0.14 KB | 3.3 KB | 24× |
-| list boards | 0.8 KB | 12 KB | 15× |
-| list projects | 1.0 KB | 26 KB | 25× |
+    subgraph CLI["atl"]
+        direction TB
+        B1["Agent"] -->|"Bash"| B2["atl · 90 ms<br/>then exits"]
+        B2 -->|"HTTPS"| B3["Atlassian API"]
+        B3 -->|"56 KB JSON"| B2
+        B2 -->|"7 KB of<br/>readable lines"| B1
+    end
+```
 
-† measured against mcp-atlassian 0.21.0 directly. The other rows compare against the raw Jira REST payload, which is the upper bound — mcp-atlassian trims some fields, so its real numbers sit between the two columns.
-
-A typical time-tracking session is 15–25 Jira calls. That is ~150–200 KB of context through MCP against ~20 KB here.
+The filtering has to happen somewhere. The only question is whether the model pays for it.
 
 ---
 
 ## What it does that mcp-atlassian cannot
 
-These are not efficiency wins. They are operations that have no MCP tool at all, verified against mcp-atlassian 0.21.0.
+Not efficiency wins — operations with **no MCP tool at all**, verified against mcp-atlassian 0.21.0 source.
 
-| | mcp-atlassian | atl |
-|---|---|---|
-| **Edit a worklog** | ✗ no tool | `atl worklog edit KEY ID --time 2h` |
-| **Delete a worklog** | ✗ no tool | `atl worklog rm KEY ID` |
-| **Upload a Jira attachment** | ✗ download only | `atl attach KEY shot.png` |
-| **Transition + comment** | ✗ fails: *"Operation value must be an Atlassian Document"* | `atl transition KEY --to Done --comment "…"` |
+| Operation | mcp-atlassian | `atl` |
+|:--|:--|:--|
+| **Edit a worklog** | ❌ only `get` and `add` exist | `atl worklog edit KEY ID --time 2h` |
+| **Delete a worklog** | ❌ same | `atl worklog rm KEY ID` |
+| **Upload a Jira attachment** | ❌ `upload` appears 0× in `jira.py` | `atl attach KEY shot.png` |
+| **Transition + comment** | ❌ *"Operation value must be an Atlassian Document"* | `atl transition KEY --to Done --comment "…"` |
 | **Diff two Confluence versions** | raw XHTML | unified diff on rendered Markdown |
 
-The transition-with-comment failure is the interesting one. Jira REST v3 and Confluence Cloud v2 take rich text as **ADF** (Atlassian Document Format), a JSON tree. A tool that cannot build ADF cannot write a comment, a description, or a page body. `atl` ships a Markdown ↔ ADF converter — headings, lists, code blocks with language, blockquotes, rules, links, inline marks, and tables, round-tripping in both directions.
+That last failure is a symptom of something deeper. Jira REST v3 and Confluence Cloud v2 take rich text as **ADF** — Atlassian Document Format, a JSON tree. A tool that cannot build ADF cannot write a comment, a description, or a page body.
+
+`atl` ships a Markdown ↔ ADF converter that round-trips headings, lists, code blocks with language, blockquotes, rules, links, inline marks and **tables**:
 
 ```console
-$ atl conf diff 829718529
+$ atl conf diff 12345678
 --- v2
 +++ v3
 @@ -1,8 +1,7 @@
@@ -106,111 +161,115 @@ $ atl conf diff 829718529
 
 ## Install
 
-**One file, no dependencies.** Pick whichever you like:
-
 ```bash
-# curl
-curl -fsSL https://raw.githubusercontent.com/AlexSerbinov/atl/main/atl -o ~/.local/bin/atl
-chmod +x ~/.local/bin/atl
+# curl — one file, nothing else
+curl -fsSL https://raw.githubusercontent.com/AlexSerbinov/atlassian-cli-for-agents/main/atl \
+  -o ~/.local/bin/atl && chmod +x ~/.local/bin/atl
 
-# pip
+# or pip
 pip install atl-cli
-
-# git
-git clone https://github.com/AlexSerbinov/atl && ln -s "$PWD/atl/atl" ~/.local/bin/atl
 ```
-
-Then:
 
 ```bash
-atl init      # prompts for site URL, email, API token; writes ~/.atl.json (mode 600)
-atl me        # verify
+atl init    # prompts for site, email, API token → ~/.atl.json (mode 600)
+atl me      # verify
 ```
 
-Get an API token at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+Get a token at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
 
-**Migrating from mcp-atlassian?** Skip `atl init`. If the `atlassian` server is still in your `~/.claude.json`, `atl` reads the credentials straight out of it and works with zero configuration. Remove the server when you are satisfied.
+> [!TIP]
+> **Coming from mcp-atlassian?** Skip `atl init` entirely. If the `atlassian` server is still in your `~/.claude.json`, `atl` reads those credentials directly and works with **zero configuration**. Remove the server once you are satisfied.
 
-Credentials are resolved in this order: `~/.atl.json` → `ATL_URL`/`ATL_USER`/`ATL_TOKEN` → `~/.jira-api-token` → the legacy MCP config.
+Resolution order: `~/.atl.json` → `ATL_URL`/`ATL_USER`/`ATL_TOKEN` → `~/.jira-api-token` → the legacy MCP config.
 
 ---
 
 ## Use it
 
-Compact output by default. `--json` gives the untouched API payload, and works both before and after the subcommand.
+Compact output by default. `--json` gives the untouched payload and works **before or after** the subcommand.
 
-### Work items
+<details open>
+<summary><b>Work items</b></summary>
 
 ```bash
-atl issue EA-1257                    # compact view, description rendered as Markdown
-atl issue EA-1257 --full             # every field, including custom fields
+atl issue PROJ-123                   # compact view, description as Markdown
+atl issue PROJ-123 --full            # every field, including custom fields
 atl search 'assignee = currentUser() AND statusCategory != Done' --limit 20
 
-atl create --project EA --type Task --summary "…" --description @body.md \
-           --assignee me --labels backend --sprint 2466
-atl edit EA-1257 --summary "…" --priority High
-atl assign EA-1257 "Alex Serbinov"   # display name or email; `none` unassigns
-atl link EA-1257 --to EA-1258 --type Blocks
-atl delete EA-1257 --subtasks
+atl create --project PROJ --type Task --summary "…" --description @body.md \
+           --assignee me --labels backend --sprint 118
+atl edit PROJ-123 --summary "…" --priority High
+atl assign PROJ-123 "Jane Doe"       # display name or email; `none` unassigns
+atl link PROJ-123 --to PROJ-124 --type Blocks
+atl delete PROJ-123 --subtasks
 ```
 
 `--description`, `--comment` and worklog comments take inline Markdown or `@path/to/file.md`. Use `@file` for anything long — it keeps the body out of your shell history.
+</details>
 
-### Statuses and comments
+<details>
+<summary><b>Statuses and comments</b></summary>
 
 ```bash
-atl transitions EA-1257                        # what is reachable now, with ids
-atl transition EA-1257 --to "In Progress"      # fuzzy match on the target status
-atl transition EA-1257 --to Done --comment "shipped in v2.7.4"
+atl transitions PROJ-123                      # what is reachable now, with ids
+atl transition PROJ-123 --to "In Progress"    # fuzzy match on the target status
+atl transition PROJ-123 --to Done --comment "shipped in v2.7.4"
 
-atl comment EA-1257 'text with **markdown**'
-atl comments EA-1257 --limit 5
-atl comment-edit EA-1257 34277 'rewritten'
-atl comment-rm EA-1257 34277
+atl comment PROJ-123 'text with **markdown**'
+atl comments PROJ-123 --limit 5
+atl comment-edit PROJ-123 34277 'rewritten'
+atl comment-rm PROJ-123 34277
+```
+</details>
+
+<details>
+<summary><b>Worklogs and time reports</b></summary>
+
+```bash
+atl worklog list PROJ-123 [--mine]
+atl worklog add  PROJ-123 2h30m --date 2026-08-22 --at 10:00:00 --comment "…"
+atl worklog edit PROJ-123 47005 --time 2h
+atl worklog rm   PROJ-123 47005
+atl report 2026-08-10 2026-08-14              # per-day totals with delta to target
 ```
 
-### Worklogs
+Durations: `2h30m`, `1d`, `45m`, `1w2d`; a bare number is minutes. Jira's workday is 8h and its week 5d, so `1d` = 8h. `--date` defaults to today, so pass it explicitly for past days — and the local UTC offset is attached automatically, because Jira rejects a naive timestamp.
+</details>
+
+<details>
+<summary><b>Sprints, boards, attachments</b></summary>
 
 ```bash
-atl worklog list EA-1257 [--mine]
-atl worklog add  EA-1257 2h30m --date 2026-08-22 --at 10:00:00 --comment "…"
-atl worklog edit EA-1257 47005 --time 2h
-atl worklog rm   EA-1257 47005
-atl report 2026-08-10 2026-08-14               # per-day totals with delta to target
-```
+atl boards --project PROJ
+atl sprint current 42                         # id of the board's active sprint
+atl sprint add current PROJ-123 PROJ-124 --board 42
+atl sprint backlog PROJ-123
+atl sprint create --board 42 --name "Sprint 20" --start 2026-08-24 --end 2026-09-07
 
-Durations: `2h30m`, `1d`, `45m`, `1w2d`; a bare number is minutes. Jira's workday is 8h and its week 5d, so `1d` = 8h. `--date` defaults to today, so pass it explicitly for past days. The local UTC offset is attached automatically — Jira rejects a naive timestamp.
-
-### Sprints, boards, attachments
-
-```bash
-atl boards --project EA
-atl sprint current 216                         # id of the board's active sprint
-atl sprint add current EA-1257 EA-1259 --board 216
-atl sprint backlog EA-1257
-atl sprint create --board 216 --name "Sprint 20" --start 2026-08-24 --end 2026-09-07
-
-atl attach EA-1257 shot.png notes.pdf
-atl download EA-1257 --name shot --dest ./tmp
+atl attach PROJ-123 shot.png notes.pdf
+atl download PROJ-123 --name shot --dest ./tmp
 atl attach-rm 29566
 ```
+</details>
 
-### Confluence
+<details>
+<summary><b>Confluence</b></summary>
 
 ```bash
 atl conf search 'title ~ "Backend" order by lastmodified desc'
-atl conf get 829718529                         # page as Markdown
+atl conf get 12345678                         # page as Markdown
 atl conf create --space DOCS --title "Notes" body.md
-atl conf put 829718529 body.md --message "why this edit"
+atl conf put 12345678 body.md --message "why this edit"
 
-atl conf comments 829718529                    # threads, replies indented
-atl conf comment 829718529 'text'
-atl conf reply 829620248 'threaded reply'
+atl conf comments 12345678                    # threads, replies indented
+atl conf comment 12345678 'text'
+atl conf reply 87654321 'threaded reply'
 
-atl conf history 829718529
-atl conf diff 829718529 --from 1 --to 3
-atl conf labels 829718529
+atl conf history 12345678
+atl conf diff 12345678 --from 1 --to 3
+atl conf labels 12345678
 ```
+</details>
 
 ### Compose it
 
@@ -218,51 +277,74 @@ The point of a CLI is that the shell does the work:
 
 ```bash
 # total logged on an issue, in hours
-atl worklog list EA-1257 --json | jq '[.[].timeSpentSeconds] | add / 3600'
+atl worklog list PROJ-123 --json | jq '[.[].timeSpentSeconds] | add / 3600'
 
-# move everything ready-to-test into the active sprint
-atl search 'project = EA AND status = "Ready for QA"' --json \
-  | jq -r '.[].key' | xargs atl sprint add current --board 216
+# move everything ready for QA into the active sprint
+atl search 'project = PROJ AND status = "Ready for QA"' --json \
+  | jq -r '.[].key' | xargs atl sprint add current --board 42
 
-# every issue you touched last week, as a changelog
+# what did I actually do last week
 atl report 2026-08-17 2026-08-21
 ```
 
 ---
 
-## Using it with an AI agent
-
-The repo ships a [Claude Code skill](skills/atlassian-cli/SKILL.md) — drop it in and the agent learns all 46 commands from one 9 KB document:
+## Wiring it into an agent
 
 ```bash
 cp -r skills/atlassian-cli ~/.claude/skills/
 ```
 
-For other agents, point them at `SKILL.md` or at `atl --help`. There is no protocol to implement and no server to run: the agent already knows how to run shell commands.
+That is a [Claude Code skill](skills/atlassian-cli/SKILL.md): one 9 KB document the agent reads once, after which it knows all 46 commands. For other agents, point them at that file or at `atl --help`.
+
+There is no protocol to implement and no server to run. Your agent already knows how to run shell commands.
 
 ---
 
 ## When you should use mcp-atlassian instead
 
-`atl` covers about 35 of mcp-atlassian's 72 tools — the ones that carry day-to-day work. It does **not** implement:
+`atl` implements ~35 of mcp-atlassian's 72 tools — the ones that carry day-to-day work. It does **not** cover:
 
-- **Jira Service Desk** — queues, SLA, request types
-- **Proforma forms**
-- **Watchers** — add/remove/list
-- **Versions and releases** — `fixVersion` management
-- **Development info** — linked branches and pull requests
-- **Batch create**, remote issue links, project components, field options
-- **Confluence** page move, user search, page-view analytics
+<div align="center">
 
-If your workflow lives in Service Desk or Proforma, use mcp-atlassian. If it is issues, comments, worklogs, sprints and pages, `atl` covers it and costs a fraction.
+| Area | Status |
+|:--|:--|
+| Jira Service Desk — queues, SLA, request types | ❌ |
+| Proforma forms | ❌ |
+| Watchers · versions & releases · development info | ❌ |
+| Batch create · remote links · project components | ❌ |
+| Confluence page move · user search · view analytics | ❌ |
+| **Server / Data Center** deployments | ❌ Cloud only |
+| **OAuth 2.0** | ❌ API token only |
 
-Also worth knowing: mcp-atlassian supports **Server/Data Center** as well as Cloud, plus OAuth. `atl` is **Cloud + API token only**. Server/DC users should look at [atlassian-skills](https://github.com/eunsanMountain/atlassian-skills), which takes the same CLI approach for on-prem.
+</div>
+
+If your workflow lives in Service Desk or Proforma, use mcp-atlassian — it is a good project with far broader coverage. If it is issues, comments, worklogs, sprints and pages, `atl` covers it at a fraction of the cost. Nothing stops you running both; they read the same API with the same token.
+
+Server/DC users who want the CLI approach should look at [atlassian-skills](https://github.com/eunsanMountain/atlassian-skills).
+
+📊 **[Full tool-by-tool comparison →](docs/comparison.md)**
+
+---
+
+## Security
+
+The token is read from `~/.atl.json` (mode 600) at call time and used only to build a `Basic` auth header. It is never printed, never logged, and **never becomes a process argument**.
+
+That last point is not theoretical. An MCP server configured the usual way takes its credentials as command-line flags — which means your Jira token sits in `ps aux`, readable by every process on the machine, for as long as the daemon runs:
+
+```console
+$ ps aux | grep mcp-atlassian
+… mcp-atlassian --jira-token=ATATT3xFfGF0EXAMPLE-not-a-real-token-0000000000 --jira-username=you@acme.com
+```
+
+This is a property of passing secrets as arguments, not a flaw unique to any project — but it disappears when there is no long-lived process. There is a test that walks the AST and fails the build if the token is ever read outside `_auth_header`.
 
 ---
 
 ## How it works
 
-One file, ~1,600 lines, standard library only. Top to bottom:
+One file, ~1,600 lines, standard library only:
 
 ```
 credentials  →  HTTP (api(), upload())  →  Markdown ↔ ADF  →  helpers
@@ -270,49 +352,34 @@ credentials  →  HTTP (api(), upload())  →  Markdown ↔ ADF  →  helpers
              →  sprints  →  boards/meta  →  Confluence  →  argparse  →  main()
 ```
 
-Adding a command is three edits: a `cmd_*(creds, a)` function, a block in `build_parser()`, and a line in the README. `api(creds, path, params, method, body, base=…)` handles auth and JSON in both directions, so most new endpoints are a five-line function.
+Adding a command is three edits: a `cmd_*(creds, a)` function, a block in `build_parser()`, and a line in this README. `api(creds, path, params, method, body, base=…)` handles auth and JSON in both directions, so most new endpoints are a five-line function.
 
-Rules the code follows, if you send a PR:
-
-- **Compact print by default**, `if a.json: return out_json(...)` as the first line of every command.
-- **Never hand-build ADF.** Call `md_to_adf(text)` and `adf_to_md(node)`.
-- **Never put the token on a command line.** It is read from disk inside `_auth_header` and nowhere else — there is a test that enforces this by walking the AST.
-
-### Security
-
-The token is read from `~/.atl.json` (mode 600) at call time and used only to build a `Basic` auth header. It is never printed, never logged, and never becomes a process argument.
-
-That last point is not theoretical. An MCP server configured the usual way receives its credentials as command-line flags, which means your Jira token is visible in `ps aux` to every process on the machine, for as long as the server runs:
-
-```console
-$ ps aux | grep mcp-atlassian
-… mcp-atlassian --jira-token=ATATT3xFfGF0EXAMPLE-not-a-real-token-0000000000 --jira-username=you@corp.com
-```
-
----
-
-## Tests
-
-39 offline tests. No network, no credentials, no Atlassian account:
+### Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v      # 39 tests, no network, no credentials
 ```
 
-They cover the Markdown ↔ ADF converter both directions (including the ADF invariant that a text node may never be empty), round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources, error unwrapping for both the Jira and Confluence error shapes, and the token-handling rule above.
+They cover the ADF converter in both directions — including the ADF invariant that a text node may never be empty — round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources, error unwrapping for **both** the Jira (`errors` as an object) and Confluence (`errors` as a list) shapes, and the token rule above.
 
-CI runs them on Linux and macOS against Python 3.8, 3.11 and 3.13.
-
-Every write path was additionally exercised against a live Jira Cloud site: create → comment → transition-with-comment → edit → worklog add/edit/delete → attach/download/delete → sprint add/backlog → assign, and for Confluence create → read → update → comment → reply → history → diff → label → delete.
+CI runs them on Linux and macOS against Python 3.8, 3.11 and 3.13. Every write path was additionally exercised against a live Jira and Confluence Cloud site: create → comment → transition-with-comment → edit → worklog add/edit/delete → attach/download/delete → sprint add/backlog → assign, and page create → read → update → comment → reply → history → diff → label → delete.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. The missing tool categories listed above are the obvious first contributions, and each is a small, self-contained function.
+Issues and PRs welcome. The unimplemented tool categories above are the obvious first contributions, and each is a small, self-contained function.
 
-Please keep the two hard constraints: **standard library only**, and **one file**. They are what make this thing trivial to audit, vendor and trust with a credential.
+Three rules, and they are the whole design:
 
-## License
+1. **Standard library only.** No dependency is worth the install friction.
+2. **One file.** It should stay something you can read in an afternoon and vendor without thinking.
+3. **Compact by default, raw on `--json`.** Never hand-build ADF — call `md_to_adf()` and `adf_to_md()`.
 
-MIT — see [LICENSE](LICENSE).
+<div align="center">
+
+**MIT licensed** · [LICENSE](LICENSE)
+
+*If this saved you a few hundred thousand tokens, a ⭐ helps other people find it.*
+
+</div>
