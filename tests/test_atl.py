@@ -154,6 +154,95 @@ class AdfToMarkdown(unittest.TestCase):
         self.assertEqual(atl.flat(doc), "a b c")
 
 
+class InlineImages(unittest.TestCase):
+    """Markdown images become real ADF media. No network here — only the parse,
+    strip and rewrite steps; the upload half is covered by live testing."""
+
+    def test_image_line_becomes_a_placeholder(self):
+        doc = atl.md_to_adf("text\n\n![a shot](shot.png)\n\nmore")
+        kinds = [n["type"] for n in doc["content"]]
+        self.assertEqual(kinds, ["paragraph", atl.IMAGE_PLACEHOLDER, "paragraph"])
+        attrs = doc["content"][1]["attrs"]
+        self.assertEqual(attrs["src"], "shot.png")
+        self.assertEqual(attrs["alt"], "a shot")
+
+    def test_several_images_on_one_line(self):
+        doc = atl.md_to_adf("![a](1.png) ![b](2.png)")
+        self.assertEqual([n["type"] for n in doc["content"]],
+                         [atl.IMAGE_PLACEHOLDER] * 2)
+
+    def test_image_inside_a_sentence_stays_text(self):
+        """ADF has no inline image Jira will render, so it must not become one."""
+        doc = atl.md_to_adf("see ![x](a.png) here")
+        self.assertEqual(doc["content"][0]["type"], "paragraph")
+        self.assertFalse(atl.has_images(doc))
+
+    def test_has_images(self):
+        self.assertTrue(atl.has_images(atl.md_to_adf("![a](x.png)")))
+        self.assertFalse(atl.has_images(atl.md_to_adf("no pictures here")))
+
+    def test_strip_images_leaves_valid_adf(self):
+        doc = atl.strip_images(atl.md_to_adf("before\n\n![a](x.png)\n\nafter"))
+        self.assertEqual([n["type"] for n in doc["content"]], ["paragraph", "paragraph"])
+        self.assertFalse(atl.has_images(doc))
+
+    def test_strip_images_never_empties_the_doc(self):
+        """An image-only body must not become an empty document — ADF rejects it."""
+        doc = atl.strip_images(atl.md_to_adf("![a](x.png)"))
+        self.assertTrue(doc["content"])
+        self.assertEqual(doc["content"][0]["type"], "paragraph")
+
+    def test_remote_url_becomes_a_link_not_an_upload(self):
+        doc = atl.resolve_media({}, atl.md_to_adf("![site](https://example.com/a.png)"),
+                                ("jira", "X-1"))
+        node = doc["content"][0]
+        self.assertEqual(node["type"], "paragraph")
+        mark = node["content"][0]["marks"][0]
+        self.assertEqual(mark["type"], "link")
+        self.assertEqual(mark["attrs"]["href"], "https://example.com/a.png")
+
+    def test_missing_file_degrades_and_warns(self):
+        import io
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with redirect_stderr(err):
+            doc = atl.resolve_media({}, atl.md_to_adf("![gone](nope-does-not-exist.png)"),
+                                    ("jira", "X-1"), base_dir="/tmp")
+        self.assertIn("missing image", doc["content"][0]["content"][0]["text"])
+        self.assertIn("not found", err.getvalue())
+
+    def test_media_node_shape(self):
+        """collection is required by Jira even when empty; alt rides along."""
+        n = atl._media_node("uuid-1", "", "a shot")
+        self.assertEqual(n["type"], "mediaSingle")
+        m = n["content"][0]
+        self.assertEqual(m["type"], "media")
+        self.assertEqual(m["attrs"]["type"], "file")
+        self.assertEqual(m["attrs"]["id"], "uuid-1")
+        self.assertIn("collection", m["attrs"])
+        self.assertEqual(m["attrs"]["alt"], "a shot")
+
+    def test_media_renders_back_to_markdown(self):
+        md = atl.adf_to_md(atl._media_node("uuid-1", "", "a shot"))
+        self.assertEqual(md.strip(), "![a shot](media:uuid-1)")
+
+    def test_body_and_dir_anchors_relative_paths_at_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "body.md")
+            with open(path, "w") as f:
+                f.write("![a](shot.png)")
+            text, base = atl._body_and_dir("@" + path)
+            self.assertEqual(text, "![a](shot.png)")
+            # abspath, not realpath: the code deliberately keeps the path the
+            # user gave it. On macOS /var is a symlink to /private/var.
+            self.assertEqual(base, os.path.dirname(os.path.abspath(path)))
+
+    def test_body_and_dir_inline_uses_cwd(self):
+        text, base = atl._body_and_dir("plain text")
+        self.assertEqual(text, "plain text")
+        self.assertEqual(base, os.getcwd())
+
+
 class Durations(unittest.TestCase):
     def test_forms(self):
         cases = {

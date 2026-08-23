@@ -147,11 +147,49 @@ Confluence Cloud v2 speaks ADF, so pages round-trip through the same Markdown
 converter as Jira, and `conf diff` diffs the *Markdown* rather than raw XHTML.
 Page body comes from a file path, or from stdin if omitted.
 
+## Images and screenshots
+
+Write plain Markdown with local paths. `atl` uploads each file as an attachment and
+rewrites it into an ADF media node, so the picture appears **inline between the
+paragraphs**, not as an anonymous file at the bottom.
+
+```bash
+atl create --project PROJ --type Bug --summary "..." --description @report.md
+atl edit PROJ-123 --description @report.md
+atl comment PROJ-123 'verified:
+
+![after the fix](after.png)'
+atl worklog add PROJ-123 1h --comment @notes.md
+atl conf create --space DOCS --title "Postmortem" report.md
+atl conf put 12345678 report.md
+```
+
+Where `report.md` contains:
+
+```markdown
+Text before.
+
+![the broken state](screenshots/before.png)
+
+Text after.
+```
+
+- **Relative paths resolve next to the `@file.md`**, so a document and its screenshots
+  travel together. Inline bodies resolve against the current directory.
+- **Only whole-line images become pictures.** `![x](a.png)` inside a sentence stays a
+  link — ADF has no inline image Jira will render.
+- **Remote `https://` images become links**, not embeds. Jira accepts an external media
+  node but does not render it.
+- **A missing file does not fail the call** — it becomes `[missing image: path]` and a
+  warning on stderr, so a long document still posts.
+- On `create`, the target does not exist yet, so `atl` creates it and then wires the
+  images in a second call. That is one extra request, and it is automatic.
+
 ## Markdown <-> ADF
 
 Supported both ways: headings, paragraphs, **bold**, *italic*, `code`, links, bullet
 and ordered lists, fenced code blocks with a language, blockquotes, horizontal rules,
-tables. Round-trip verified against the live API. Anything unsupported degrades to a
+tables, and images (see above). Round-trip verified against the live API. Anything unsupported degrades to a
 plain paragraph instead of failing the call — so exotic ADF (panels, expand blocks,
 `@mentions`, nested tables) survives reading but flattens on write.
 

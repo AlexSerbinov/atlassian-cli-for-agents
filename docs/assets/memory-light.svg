@@ -1,26 +1,43 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="250" viewBox="0 0 880 250" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="384" viewBox="0 0 880 384" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
 <text x="0" y="22" font-size="16" font-weight="600" fill="#1f2328">Resident memory, by number of open agent sessions</text>
 <text x="0" y="43" font-size="12.5" fill="#59636e">An MCP server is one daemon per session, running whether or not you touch Jira that day.</text>
-<line x1="0" y1="58" x2="880" y2="58" stroke="#d1d9e0"/>
-<text x="0" y="92" font-size="13" fill="#1f2328">1 session</text>
-<rect x="132" y="79" width="560" height="18" rx="3" fill="#eaeef2"/>
-<rect x="132" y="79" width="28.0" height="18" rx="3" fill="#cf222e"/>
-<text x="170.0" y="93" font-size="12.5" fill="#cf222e" font-weight="600">137 MB</text>
-<text x="876" y="93" font-size="12.5" text-anchor="end" fill="#1a7f37" font-weight="600">atl: 0 MB</text>
-<text x="0" y="132" font-size="13" fill="#1f2328">5 sessions</text>
-<rect x="132" y="119" width="560" height="18" rx="3" fill="#eaeef2"/>
-<rect x="132" y="119" width="140.0" height="18" rx="3" fill="#cf222e"/>
-<text x="282.0" y="133" font-size="12.5" fill="#cf222e" font-weight="600">685 MB</text>
-<text x="876" y="133" font-size="12.5" text-anchor="end" fill="#1a7f37" font-weight="600">atl: 0 MB</text>
-<text x="0" y="172" font-size="13" fill="#1f2328">10 sessions</text>
-<rect x="132" y="159" width="560" height="18" rx="3" fill="#eaeef2"/>
-<rect x="132" y="159" width="280.0" height="18" rx="3" fill="#cf222e"/>
-<text x="422.0" y="173" font-size="12.5" fill="#cf222e" font-weight="600">1.3 GB</text>
-<text x="876" y="173" font-size="12.5" text-anchor="end" fill="#1a7f37" font-weight="600">atl: 0 MB</text>
-<text x="0" y="212" font-size="13" fill="#1f2328">20 sessions</text>
-<rect x="132" y="199" width="560" height="18" rx="3" fill="#eaeef2"/>
-<rect x="132" y="199" width="560.0" height="18" rx="3" fill="#cf222e"/>
-<text x="702.0" y="213" font-size="12.5" fill="#cf222e" font-weight="600">2.7 GB</text>
-<text x="876" y="213" font-size="12.5" text-anchor="end" fill="#1a7f37" font-weight="600">atl: 0 MB</text>
-<text x="0" y="236" font-size="11" fill="#59636e">mcp-atlassian 0.21.0 measured at ~137 MB RSS per process · atl starts, runs for ~90 ms, and exits</text>
+<text x="0" y="61" font-size="12.5" fill="#59636e">atl holds nothing between calls, so the number never grows.</text>
+<rect x="128" y="70" width="11" height="11" rx="2.5" fill="#cf222e"/>
+<text x="145" y="80" font-size="12.5" fill="#1f2328">mcp-atlassian</text>
+<rect x="246" y="70" width="11" height="11" rx="2.5" fill="#1a7f37"/>
+<text x="263" y="80" font-size="12.5" fill="#1f2328">atl</text>
+<line x1="0" y1="82" x2="880" y2="82" stroke="#d1d9e0"/>
+<text x="0" y="118" font-size="13.5" font-weight="600" fill="#1f2328">1 session</text>
+<rect x="128" y="98" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="98" width="30.0" height="17" rx="3" fill="#cf222e"/>
+<text x="168.0" y="111" font-size="12.5" font-weight="600" fill="#cf222e">137 MB</text>
+<rect x="128" y="121" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="121" width="3" height="17" rx="1.5" fill="#1a7f37"/>
+<text x="141" y="134" font-size="12.5" font-weight="600" fill="#1a7f37">0 MB</text>
+<text x="190" y="134" font-size="11.5" fill="#59636e">nothing resident — the process already exited</text>
+<text x="0" y="180" font-size="13.5" font-weight="600" fill="#1f2328">5 sessions</text>
+<rect x="128" y="160" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="160" width="150.0" height="17" rx="3" fill="#cf222e"/>
+<text x="288.0" y="173" font-size="12.5" font-weight="600" fill="#cf222e">685 MB</text>
+<rect x="128" y="183" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="183" width="3" height="17" rx="1.5" fill="#1a7f37"/>
+<text x="141" y="196" font-size="12.5" font-weight="600" fill="#1a7f37">0 MB</text>
+<text x="190" y="196" font-size="11.5" fill="#59636e">nothing resident — the process already exited</text>
+<text x="0" y="242" font-size="13.5" font-weight="600" fill="#1f2328">10 sessions</text>
+<rect x="128" y="222" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="222" width="300.0" height="17" rx="3" fill="#cf222e"/>
+<text x="438.0" y="235" font-size="12.5" font-weight="600" fill="#cf222e">1.3 GB</text>
+<rect x="128" y="245" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="245" width="3" height="17" rx="1.5" fill="#1a7f37"/>
+<text x="141" y="258" font-size="12.5" font-weight="600" fill="#1a7f37">0 MB</text>
+<text x="190" y="258" font-size="11.5" fill="#59636e">nothing resident — the process already exited</text>
+<text x="0" y="304" font-size="13.5" font-weight="600" fill="#1f2328">20 sessions</text>
+<rect x="128" y="284" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="284" width="600.0" height="17" rx="3" fill="#cf222e"/>
+<text x="738.0" y="297" font-size="12.5" font-weight="600" fill="#cf222e">2.7 GB</text>
+<rect x="128" y="307" width="600" height="17" rx="3" fill="#eaeef2"/>
+<rect x="128" y="307" width="3" height="17" rx="1.5" fill="#1a7f37"/>
+<text x="141" y="320" font-size="12.5" font-weight="600" fill="#1a7f37">0 MB</text>
+<text x="190" y="320" font-size="11.5" fill="#59636e">nothing resident — the process already exited</text>
+<text x="0" y="372" font-size="11" fill="#59636e">mcp-atlassian 0.21.0 measured at ~137 MB RSS per process · atl runs for ~90 ms per call</text>
 </svg>

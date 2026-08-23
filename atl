@@ -333,6 +333,19 @@ def md_to_adf(text):
             i += 1
             continue
 
+        # a line that is nothing but images becomes block-level media. Inline
+        # images inside a sentence stay links — ADF has no inline image that
+        # Jira will render, and a silent downgrade beats a broken document.
+        if stripped.startswith("!["):
+            imgs = re.findall(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)", stripped)
+            if imgs and re.fullmatch(r"(?:!\[[^\]]*\]\([^)]+\)\s*)+", stripped):
+                para(buf); buf = []
+                for alt, src, _title in imgs:
+                    content.append({"type": IMAGE_PLACEHOLDER,
+                                    "attrs": {"src": src, "alt": alt}})
+                i += 1
+                continue
+
         # table: a header row followed by a |---|---| separator
         if (stripped.startswith("|") and i + 1 < len(lines)
                 and re.fullmatch(r"\|[\s:|-]+\|", lines[i + 1].strip() or "|")):
@@ -468,8 +481,17 @@ def adf_to_md(node, depth=0):
             head = rows[0].count("|") - 1
             rows.insert(1, "|" + "---|" * head)
         return "\n".join(rows) + "\n\n"
-    if t == "mediaSingle" or t == "mediaGroup":
-        return "[media]\n\n"
+    if t in ("mediaSingle", "mediaGroup"):
+        out = []
+        for m in kids:
+            a = m.get("attrs", {}) or {}
+            alt = a.get("alt") or "image"
+            ref = a.get("url") or f"media:{a.get('id', '')}"
+            out.append(f"![{alt}]({ref})")
+        return "\n".join(out) + "\n\n"
+    if t == "media":
+        a = node.get("attrs", {}) or {}
+        return f"![{a.get('alt') or 'image'}]({a.get('url') or 'media:' + str(a.get('id',''))})"
     if t == "mention":
         return "@" + node.get("attrs", {}).get("text", "").lstrip("@")
     if t == "emoji":
@@ -477,6 +499,175 @@ def adf_to_md(node, depth=0):
     if t == "doc":
         return adf_to_md(kids, depth)
     return adf_to_md(kids, depth)
+
+
+IMAGE_PLACEHOLDER = "_atlImage"
+
+
+def _body_and_dir(text):
+    """Body text plus the directory relative paths inside it resolve against.
+
+    `@file.md` reads the file and anchors image paths next to it, which is what
+    anyone writing a document with screenshots beside it expects.
+    """
+    if text.startswith("@"):
+        path = os.path.expanduser(text[1:])
+        with open(path) as f:
+            return f.read(), os.path.dirname(os.path.abspath(path))
+    return text, os.getcwd()
+
+
+def _jira_media_id(creds, attachment_id):
+    """The ADF media UUID behind a Jira attachment.
+
+    Jira validates that a media node's id is a real media-services file, and no
+    REST field exposes it. The content endpoint 303s to the media API, and the
+    UUID is in that Location header.
+    """
+    url = f"{creds['url']}/rest/api/3/attachment/content/{attachment_id}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+
+    req = urllib.request.Request(url, headers={"Authorization": _auth_header(creds)})
+    try:
+        urllib.request.build_opener(_NoRedirect).open(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "") or ""
+        m = re.search(r"/file/([0-9a-fA-F-]{36})", loc)
+        if m:
+            return m.group(1)
+    raise ApiError(0, f"could not resolve a media id for attachment {attachment_id}", url)
+
+
+def _media_node(file_id, collection, alt, width=None, height=None):
+    attrs = {"type": "file", "id": file_id, "collection": collection}
+    if alt:
+        attrs["alt"] = alt
+    if width:
+        attrs["width"], attrs["height"] = width, height
+    return {"type": "mediaSingle", "attrs": {"layout": "center"},
+            "content": [{"type": "media", "attrs": attrs}]}
+
+
+def _upload_for_media(creds, target, path, alt):
+    """Attach a local file to the target and return the ADF node that shows it."""
+    kind, ident = target
+    if kind == "jira":
+        res = upload(creds, f"/rest/api/3/issue/{ident}/attachments", path)
+        att = res[0] if isinstance(res, list) else res
+        # collection must be present but may be empty for issue attachments
+        return _media_node(_jira_media_id(creds, att["id"]), "", alt or att["filename"])
+    if kind == "confluence":
+        res = upload(creds, f"/rest/api/content/{ident}/child/attachment", path,
+                     base=creds["confluence_url"])
+        a = (res.get("results") or [res])[0]
+        ext = a.get("extensions", {}) or {}
+        if not ext.get("fileId"):
+            raise ApiError(0, f"Confluence returned no fileId for {path}", ident)
+        return _media_node(ext["fileId"], ext.get("collectionName", f"contentId-{ident}"),
+                           alt or a.get("title", ""))
+    raise ValueError(f"unknown media target {kind!r}")
+
+
+def resolve_media(creds, doc, target, base_dir=None):
+    """Replace image placeholders with real media nodes, uploading as needed.
+
+    Local paths are attached to `target` and become inline images. Remote URLs
+    become links: Jira accepts an external media node but does not render it,
+    and a link that works beats an image that silently does not.
+    """
+    base_dir = base_dir or os.getcwd()
+    uploaded = {}
+    missing = []
+
+    def convert(node):
+        src = node["attrs"]["src"]
+        alt = node["attrs"].get("alt", "")
+        if re.match(r"^[a-z][a-z0-9+.-]*://", src, re.I):
+            label = alt or src
+            return {"type": "paragraph", "content": [
+                {"type": "text", "text": label,
+                 "marks": [{"type": "link", "attrs": {"href": src}}]}]}
+        path = os.path.expanduser(src)
+        if not os.path.isabs(path):
+            path = os.path.join(base_dir, path)
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            missing.append(src)
+            return {"type": "paragraph", "content": [
+                {"type": "text", "text": f"[missing image: {src}]"}]}
+        if path not in uploaded:
+            uploaded[path] = _upload_for_media(creds, target, path, alt)
+        node_out = json.loads(json.dumps(uploaded[path]))
+        if alt:
+            node_out["content"][0]["attrs"]["alt"] = alt
+        return node_out
+
+    def walk(container):
+        out = []
+        for n in container:
+            if isinstance(n, dict) and n.get("type") == IMAGE_PLACEHOLDER:
+                out.append(convert(n))
+                continue
+            if isinstance(n, dict) and n.get("content"):
+                n["content"] = walk(n["content"])
+            out.append(n)
+        return out
+
+    doc["content"] = walk(doc.get("content", []))
+    if missing:
+        print(f"atl: warning — image file(s) not found: {', '.join(missing)}",
+              file=sys.stderr)
+    return doc
+
+
+def has_images(doc):
+    found = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("type") == IMAGE_PLACEHOLDER:
+                found.append(n)
+            for c in n.get("content", []) or []:
+                walk(c)
+        elif isinstance(n, list):
+            for c in n:
+                walk(c)
+
+    walk(doc)
+    return bool(found)
+
+
+def strip_images(doc):
+    """Drop image placeholders so the document is valid ADF before the target
+    exists. Used for the first pass of create; the second pass puts them back
+    as real media once there is something to attach to."""
+    def walk(container):
+        out = []
+        for n in container:
+            if isinstance(n, dict) and n.get("type") == IMAGE_PLACEHOLDER:
+                continue
+            if isinstance(n, dict) and n.get("content"):
+                n["content"] = walk(n["content"])
+            out.append(n)
+        return out
+
+    doc["content"] = walk(doc.get("content", []))
+    if not doc["content"]:
+        doc["content"] = [{"type": "paragraph",
+                           "content": [{"type": "text", "text": " "}]}]
+    return doc
+
+
+def body_adf(creds, text, target=None):
+    """Markdown -> ADF, uploading any local images to `target` along the way."""
+    raw, base = _body_and_dir(text)
+    doc = md_to_adf(raw)
+    if target is not None:
+        doc = resolve_media(creds, doc, target, base)
+    return doc
 
 
 def flat(adf):
@@ -725,18 +916,22 @@ def _find_ac_field(creds, project, issuetype):
 
 
 def cmd_create(creds, a):
+    ac_field_id = None
     fields = {
         "project": {"key": a.project},
         "summary": a.summary,
         "issuetype": {"name": a.type},
     }
     if a.description:
-        fields["description"] = md_to_adf(_maybe_file(a.description))
+        # Placeholders are not valid ADF, and there is nothing to attach to
+        # until the issue has a key. Strip them now, wire them in below.
+        fields["description"] = strip_images(md_to_adf(_body_and_dir(a.description)[0]))
     if a.ac:
         fid = a.ac_field or _find_ac_field(creds, a.project, a.type)
         if not fid:
             sys.exit("atl: no Acceptance Criteria field on this project; pass --ac-field")
-        fields[fid] = md_to_adf(_maybe_file(a.ac))
+        fields[fid] = strip_images(md_to_adf(_body_and_dir(a.ac)[0]))
+        ac_field_id = fid
     if a.assignee:
         fields["assignee"] = {"id": resolve_account(creds, a.assignee)}
     if a.parent:
@@ -752,6 +947,17 @@ def cmd_create(creds, a):
         fields[k] = _coerce(v)
 
     res = api(creds, "/rest/api/3/issue", method="POST", body={"fields": fields})
+
+    # Second pass: images can only be attached once the issue has a key.
+    late = {}
+    if a.description and has_images(md_to_adf(_body_and_dir(a.description)[0])):
+        late["description"] = body_adf(creds, a.description, ("jira", res["key"]))
+    if a.ac and ac_field_id and has_images(md_to_adf(_body_and_dir(a.ac)[0])):
+        late[ac_field_id] = body_adf(creds, a.ac, ("jira", res["key"]))
+    if late:
+        api(creds, f"/rest/api/3/issue/{res['key']}", method="PUT",
+            body={"fields": late})
+
     if a.json:
         return out_json(res)
     print(f"{res['key']}  {creds['url']}/browse/{res['key']}")
@@ -780,7 +986,7 @@ def cmd_edit(creds, a):
     if a.summary:
         fields["summary"] = a.summary
     if a.description:
-        fields["description"] = md_to_adf(_maybe_file(a.description))
+        fields["description"] = body_adf(creds, a.description, ("jira", a.key))
     if a.ac:
         fid = a.ac_field
         if not fid:
@@ -789,7 +995,7 @@ def cmd_edit(creds, a):
                                  i["fields"]["issuetype"]["name"])
         if not fid:
             sys.exit("atl: no Acceptance Criteria field found; pass --ac-field")
-        fields[fid] = md_to_adf(_maybe_file(a.ac))
+        fields[fid] = body_adf(creds, a.ac, ("jira", a.key))
     if a.assignee:
         fields["assignee"] = {"id": resolve_account(creds, a.assignee)}
     if a.labels:
@@ -829,13 +1035,13 @@ def cmd_transition(creds, a):
     # mcp-atlassian could not do this in one step; here it is just a second call.
     if a.comment:
         api(creds, f"/rest/api/3/issue/{a.key}/comment", method="POST",
-            body={"body": md_to_adf(_maybe_file(a.comment))})
+            body={"body": body_adf(creds, a.comment, ("jira", a.key))})
         print(f"{a.key} comment added")
 
 
 def cmd_comment(creds, a):
     res = api(creds, f"/rest/api/3/issue/{a.key}/comment", method="POST",
-              body={"body": md_to_adf(_maybe_file(a.text))})
+              body={"body": body_adf(creds, a.text, ("jira", a.key))})
     print(f"{a.key} comment {res['id']} added")
 
 
@@ -863,7 +1069,7 @@ def cmd_delete(creds, a):
 
 def cmd_comment_edit(creds, a):
     api(creds, f"/rest/api/3/issue/{a.key}/comment/{a.id}", method="PUT",
-        body={"body": md_to_adf(_maybe_file(a.text))})
+        body={"body": body_adf(creds, a.text, ("jira", a.key))})
     print(f"{a.key} comment {a.id} updated")
 
 
@@ -996,7 +1202,7 @@ def cmd_worklog_add(creds, a):
         "started": jira_datetime(a.date, a.at),
     }
     if a.comment:
-        body["comment"] = md_to_adf(_maybe_file(a.comment))
+        body["comment"] = body_adf(creds, a.comment, ("jira", a.key))
     res = api(creds, f"/rest/api/3/issue/{a.key}/worklog", method="POST", body=body,
               params={"notifyUsers": "false"})
     print(f"{a.key} +{fmt_duration(body['timeSpentSeconds'])} on "
@@ -1010,7 +1216,7 @@ def cmd_worklog_edit(creds, a):
     if a.date or a.at != "12:00:00":
         body["started"] = jira_datetime(a.date, a.at)
     if a.comment:
-        body["comment"] = md_to_adf(_maybe_file(a.comment))
+        body["comment"] = body_adf(creds, a.comment, ("jira", a.key))
     if not body:
         sys.exit("atl: nothing to change")
     api(creds, f"/rest/api/3/issue/{a.key}/worklog/{a.id}", method="PUT", body=body,
@@ -1130,8 +1336,11 @@ def cmd_conf_get(creds, a):
 def cmd_conf_put(creds, a):
     cur = api(creds, f"/api/v2/pages/{a.id}", {"body-format": "storage"},
               base=creds["confluence_url"])
-    md = _maybe_file(a.body if a.body.startswith("@") else "@" + a.body) \
-        if a.body else sys.stdin.read()
+    md = a.body if a.body and a.body.startswith("@") else \
+        ("@" + a.body if a.body else None)
+    doc = body_adf(creds, md, ("confluence", str(a.id))) if md \
+        else resolve_media(creds, md_to_adf(sys.stdin.read()),
+                           ("confluence", str(a.id)))
     title = a.title or cur["title"]
     body = {
         "id": str(a.id),
@@ -1139,8 +1348,7 @@ def cmd_conf_put(creds, a):
         "title": title,
         "version": {"number": cur["version"]["number"] + 1,
                     "message": a.message or "updated via atl"},
-        "body": {"representation": "atlas_doc_format",
-                 "value": json.dumps(md_to_adf(md))},
+        "body": {"representation": "atlas_doc_format", "value": json.dumps(doc)},
     }
     res = api(creds, f"/api/v2/pages/{a.id}", method="PUT", body=body,
               base=creds["confluence_url"])
@@ -1148,8 +1356,9 @@ def cmd_conf_put(creds, a):
 
 
 def cmd_conf_create(creds, a):
-    md = _maybe_file(a.body if a.body.startswith("@") else "@" + a.body) \
-        if a.body else sys.stdin.read()
+    md, base = _body_and_dir(("@" + a.body) if a.body else "-")
+    if not a.body:
+        md, base = sys.stdin.read(), os.getcwd()
     space_id = a.space_id
     if not space_id:
         sp = api(creds, "/api/v2/spaces", {"keys": a.space},
@@ -1163,12 +1372,23 @@ def cmd_conf_create(creds, a):
         "status": "current",
         "title": a.title,
         "body": {"representation": "atlas_doc_format",
-                 "value": json.dumps(md_to_adf(md))},
+                 "value": json.dumps(strip_images(md_to_adf(md)))},
     }
     if a.parent:
         body["parentId"] = str(a.parent)
     res = api(creds, "/api/v2/pages", method="POST", body=body,
               base=creds["confluence_url"])
+
+    if has_images(md_to_adf(md)):
+        doc = resolve_media(creds, md_to_adf(md), ("confluence", str(res["id"])), base)
+        api(creds, f"/api/v2/pages/{res['id']}", method="PUT",
+            base=creds["confluence_url"], body={
+                "id": str(res["id"]), "status": "current", "title": a.title,
+                "version": {"number": res["version"]["number"] + 1,
+                            "message": "attach images"},
+                "body": {"representation": "atlas_doc_format",
+                         "value": json.dumps(doc)}})
+
     print(f"{res['id']}  {creds['confluence_url']}{res['_links']['webui']}")
 
 
@@ -1283,16 +1503,22 @@ def _account_names(creds, account_ids):
 def cmd_conf_comment(creds, a):
     body = {"pageId": str(a.id),
             "body": {"representation": "atlas_doc_format",
-                     "value": json.dumps(md_to_adf(_maybe_file(a.text)))}}
+                     "value": json.dumps(body_adf(creds, a.text,
+                                                  ("confluence", str(a.id))))}}
     res = api(creds, "/api/v2/footer-comments", method="POST", body=body,
               base=creds["confluence_url"])
     print(f"page {a.id} comment {res['id']} added")
 
 
 def cmd_conf_reply(creds, a):
+    # images attach to the page the thread lives on, so look that up first
+    parent = api(creds, f"/api/v2/footer-comments/{a.comment_id}",
+                 base=creds["confluence_url"])
+    page_id = str(parent.get("pageId") or parent.get("blogPostId") or "")
+    target = ("confluence", page_id) if page_id else None
     body = {"parentCommentId": str(a.comment_id),
             "body": {"representation": "atlas_doc_format",
-                     "value": json.dumps(md_to_adf(_maybe_file(a.text)))}}
+                     "value": json.dumps(body_adf(creds, a.text, target))}}
     res = api(creds, "/api/v2/footer-comments", method="POST", body=body,
               base=creds["confluence_url"])
     print(f"reply {res['id']} added under comment {a.comment_id}")

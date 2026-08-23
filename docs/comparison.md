@@ -99,9 +99,16 @@ Verified against 0.21.0 source, not inferred:
 | Delete a worklog | ✗ same | `atl worklog rm` |
 | Upload a **Jira** attachment | ✗ — the string `upload` appears 0 times in `jira.py` | `atl attach` |
 | Transition **with** a comment | ✗ — fails with *"Operation value must be an Atlassian Document"* | `atl transition --comment` |
+| Inline images in a description / page | ❌ | `![alt](local.png)` uploads and embeds |
 | Confluence version diff | raw XHTML | unified diff on rendered Markdown |
 
-The transition failure is a symptom of a deeper gap: Jira REST v3 and Confluence Cloud v2
+Inline images deserve a note. mcp-atlassian can *attach* a file to a Confluence page,
+but neither product gets a picture **into the body text**, because that requires emitting
+an ADF `mediaSingle` node — and for Jira it requires a media-services UUID that no REST
+field returns. `atl` recovers it from the 303 redirect on the attachment content endpoint;
+Confluence hands back `fileId` and `collectionName` in the upload response.
+
+The transition failure is a symptom of the same deeper gap: Jira REST v3 and Confluence Cloud v2
 take rich text as **ADF**, a JSON tree. Without an ADF builder you cannot write a comment,
 a description, or a page body. `atl` ships a Markdown ↔ ADF converter in both directions.
 

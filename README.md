@@ -1,8 +1,10 @@
 <div align="center">
 
-# `atl`
+# Atlassian for Agents
 
 ### Jira + Confluence Cloud from your shell — built for AI coding agents
+
+<sub>the command is `atl`</sub>
 
 **A single file. Zero dependencies. No daemon.**
 A drop-in replacement for the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server that puts **5–25× fewer tokens** in your model's context.
@@ -136,11 +138,40 @@ Not efficiency wins — operations with **no MCP tool at all**, verified against
 | **Delete a worklog** | ❌ same | `atl worklog rm KEY ID` |
 | **Upload a Jira attachment** | ❌ `upload` appears 0× in `jira.py` | `atl attach KEY shot.png` |
 | **Transition + comment** | ❌ *"Operation value must be an Atlassian Document"* | `atl transition KEY --to Done --comment "…"` |
+| **Inline images in a description** | ❌ no ADF, no media nodes | `![shot](shot.png)` — uploaded and embedded |
 | **Diff two Confluence versions** | raw XHTML | unified diff on rendered Markdown |
 
 That last failure is a symptom of something deeper. Jira REST v3 and Confluence Cloud v2 take rich text as **ADF** — Atlassian Document Format, a JSON tree. A tool that cannot build ADF cannot write a comment, a description, or a page body.
 
 `atl` ships a Markdown ↔ ADF converter that round-trips headings, lists, code blocks with language, blockquotes, rules, links, inline marks and **tables**:
+
+### Screenshots that actually sit in the text
+
+Write ordinary Markdown with local image paths. `atl` uploads each file as an attachment and rewrites it into an ADF media node, so the picture lands **between the paragraphs** rather than as an anonymous file at the bottom of the ticket.
+
+```markdown
+## Before
+
+![the broken state](before.png)
+
+The card rendered with the wrong issuer label.
+
+## After
+
+![the fixed state](after.png)
+```
+
+```bash
+atl create --project PROJ --type Bug --summary "Wrong issuer label" --description @report.md
+atl comment PROJ-123 'verified after the fix
+
+![after](after.png)'
+atl conf put 12345678 report.md
+```
+
+Relative paths resolve next to the `@file.md` they came from, so a document and its screenshots travel together. The same syntax works in descriptions, comments, worklog comments, acceptance criteria and Confluence pages. Remote `https://` images stay links — Jira accepts an external media node but does not render it, and a link that works beats an image that silently does not.
+
+<sub>Under the hood: Jira validates that a media node points at a real media-services file and exposes that UUID nowhere in its REST fields — `atl` recovers it from the 303 redirect on the attachment content endpoint. Confluence hands back `fileId` and `collectionName` directly. Both paths are verified against the live API.</sub>
 
 ```console
 $ atl conf diff 12345678
@@ -357,10 +388,10 @@ Adding a command is three edits: a `cmd_*(creds, a)` function, a block in `build
 ### Tests
 
 ```bash
-python -m unittest discover -s tests -v      # 39 tests, no network, no credentials
+python -m unittest discover -s tests -v      # 51 tests, no network, no credentials
 ```
 
-They cover the ADF converter in both directions — including the ADF invariant that a text node may never be empty — round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources, error unwrapping for **both** the Jira (`errors` as an object) and Confluence (`errors` as a list) shapes, and the token rule above.
+They cover the Markdown-image pipeline (parse, strip, rewrite, remote-URL and missing-file fallbacks), the ADF converter in both directions — including the ADF invariant that a text node may never be empty — round-trip idempotency, duration parsing, timestamp shape, credential resolution across all four sources, error unwrapping for **both** the Jira (`errors` as an object) and Confluence (`errors` as a list) shapes, and the token rule above.
 
 CI runs them on Linux and macOS against Python 3.8, 3.11 and 3.13. Every write path was additionally exercised against a live Jira and Confluence Cloud site: create → comment → transition-with-comment → edit → worklog add/edit/delete → attach/download/delete → sprint add/backlog → assign, and page create → read → update → comment → reply → history → diff → label → delete.
 
