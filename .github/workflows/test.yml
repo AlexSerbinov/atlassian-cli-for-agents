@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.8", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests (offline, no credentials needed)
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke test
+        run: |
+          python atl --version
+          python atl --help
+      - name: Every subcommand must parse
+        run: |
+          python - <<'PY'
+          from importlib.machinery import SourceFileLoader
+          m = SourceFileLoader("atl", "atl").load_module()
+          p = m.build_parser()
+          names = list(p._subparsers._group_actions[0].choices)
+          print(f"{len(names)} subcommands: {' '.join(names)}")
+          assert len(names) >= 25
+          PY

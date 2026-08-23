@@ -1,0 +1,1668 @@
+#!/usr/bin/env python3
+"""atl — a token-efficient CLI for Jira and Confluence Cloud.
+
+Built as a drop-in replacement for the mcp-atlassian MCP server. Same operations,
+but the shell does the filtering instead of the model, so intermediate JSON never
+reaches the context window.
+
+Design constraints, in priority order:
+
+  1. **stdlib only.** No pip install, no venv, no lock file. It starts in ~90 ms
+     and it will still run in five years.
+  2. **One file.** Vendor it, read it, patch it. There is no framework to learn.
+  3. **No resident process.** An MCP server is one process per editor session and
+     it lives whether or not you touch Jira that day. This starts, works, exits.
+  4. **Compact by default, raw on request.** Every command prints lines meant to
+     be read; `--json` gives the untouched API payload for `jq`.
+  5. **ADF is built locally.** Atlassian Document Format is what Jira REST v3 and
+     Confluence Cloud v2 accept for rich text. Tools that cannot build it lose
+     comments, descriptions and page bodies; this one converts Markdown both ways.
+
+Credentials are looked up in this order:
+
+  1. ``~/.atl.json``      {"url":…, "user":…, "token":…, "confluence_url":…}
+  2. ``ATL_URL`` / ``ATL_USER`` / ``ATL_TOKEN`` environment variables
+  3. ``~/.jira-api-token``  (token only, paired with ATL_URL / ATL_USER)
+  4. ``~/.claude.json``   the legacy ``atlassian`` MCP server args, so that people
+                          migrating off mcp-atlassian work with zero configuration
+
+Run ``atl init`` to write ``~/.atl.json`` interactively.
+
+The token is read from disk at call time. It is never printed, never logged, and
+never passed as a command-line argument, so it does not show up in ``ps``.
+
+MIT licensed. https://github.com/AlexSerbinov/atl
+"""
+
+__version__ = "0.1.0"
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+ATL_CONFIG = os.path.join(HOME, ".atl.json")
+TOKEN_FILE = os.path.join(HOME, ".jira-api-token")
+CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
+
+# Jira's Sprint field is a custom field whose id differs per site. It is resolved
+# once per call and cached in ~/.atl.json so the lookup does not repeat.
+SPRINT_FIELD_DEFAULT = "customfield_10020"
+
+
+# --------------------------------------------------------------------------
+# credentials
+# --------------------------------------------------------------------------
+
+def _from_claude_json():
+    """Legacy source: the mcp-atlassian server args in ~/.claude.json."""
+    try:
+        with open(CLAUDE_CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    args = cfg.get("mcpServers", {}).get("atlassian", {}).get("args", [])
+    out = {}
+    keys = {
+        "--jira-url=": "url",
+        "--jira-username=": "user",
+        "--jira-token=": "token",
+        "--confluence-url=": "confluence_url",
+    }
+    for a in args:
+        for prefix, name in keys.items():
+            if a.startswith(prefix):
+                out[name] = a[len(prefix):]
+    return out
+
+
+def load_creds():
+    out = {}
+    if os.path.exists(ATL_CONFIG):
+        try:
+            with open(ATL_CONFIG) as f:
+                out.update(json.load(f))
+        except ValueError as e:
+            sys.exit(f"atl: {ATL_CONFIG} is not valid JSON: {e}")
+
+    out.setdefault("url", os.environ.get("ATL_URL", ""))
+    out.setdefault("user", os.environ.get("ATL_USER", ""))
+
+    if not out.get("token"):
+        out["token"] = os.environ.get("ATL_TOKEN", "")
+
+    if not out.get("token") and os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE) as f:
+            out["token"] = f.read().strip()
+
+    if not all(out.get(k) for k in ("url", "user", "token")):
+        for k, v in _from_claude_json().items():
+            if not out.get(k):
+                out[k] = v
+
+    missing = [k for k in ("url", "user", "token") if not out.get(k)]
+    if missing:
+        sys.exit(
+            f"atl: missing credentials: {', '.join(missing)}.\n"
+            f"Create {ATL_CONFIG} with "
+            '{"url": "https://you.atlassian.net", "user": "you@x.com", "token": "..."}'
+        )
+
+    out["url"] = out["url"].rstrip("/")
+    if not out.get("confluence_url"):
+        out["confluence_url"] = out["url"] + "/wiki"
+    out["confluence_url"] = out["confluence_url"].rstrip("/")
+    return out
+
+
+def resolve_sprint_field(creds):
+    """Find the Sprint custom field id for this site, and remember it."""
+    if creds.get("sprint_field"):
+        return creds["sprint_field"]
+    try:
+        for f in api(creds, "/rest/api/3/field"):
+            if f.get("name") == "Sprint" and f.get("custom"):
+                fid = f["id"]
+                _remember(creds, "sprint_field", fid)
+                return fid
+    except ApiError:
+        pass
+    return SPRINT_FIELD_DEFAULT
+
+
+def _remember(creds, key, value):
+    """Cache a resolved site constant back into ~/.atl.json. Best effort."""
+    creds[key] = value
+    try:
+        cfg = {}
+        if os.path.exists(ATL_CONFIG):
+            with open(ATL_CONFIG) as f:
+                cfg = json.load(f)
+        cfg[key] = value
+        tmp = ATL_CONFIG + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ATL_CONFIG)
+    except (OSError, ValueError):
+        pass
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+class ApiError(Exception):
+    def __init__(self, status, body, url):
+        self.status, self.body, self.url = status, body, url
+        super().__init__(f"HTTP {status} on {url}\n{body}")
+
+
+def _auth_header(creds):
+    raw = f"{creds['user']}:{creds['token']}".encode()
+    return "Basic " + base64.b64encode(raw).decode()
+
+
+def api(creds, path, params=None, method="GET", body=None, base=None, raw=False):
+    """One JSON call. `path` is absolute-from-host, e.g. /rest/api/3/myself."""
+    host = base or creds["url"]
+    url = host + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+
+    data = None
+    headers = {"Authorization": _auth_header(creds), "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            payload = r.read()
+            if raw:
+                return payload
+            if not payload:
+                return {}
+            return json.loads(payload)
+    except urllib.error.HTTPError as e:
+        raise ApiError(e.code, e.read().decode("utf-8", "replace")[:2000], url) from None
+
+
+def upload(creds, path, filepath, base=None, field="file", extra_headers=None):
+    """multipart/form-data POST — attachments."""
+    host = base or creds["url"]
+    url = host + path
+    boundary = "----atl" + uuid.uuid4().hex
+    name = os.path.basename(filepath)
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+    with open(filepath, "rb") as f:
+        content = f.read()
+
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="{field}"; filename="{name}"\r\n'.encode(),
+        f"Content-Type: {ctype}\r\n\r\n".encode(),
+        content,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+
+    headers = {
+        "Authorization": _auth_header(creds),
+        "Accept": "application/json",
+        "X-Atlassian-Token": "no-check",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    headers.update(extra_headers or {})
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            payload = r.read()
+            return json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as e:
+        raise ApiError(e.code, e.read().decode("utf-8", "replace")[:2000], url) from None
+
+
+# --------------------------------------------------------------------------
+# ADF  <->  Markdown
+# --------------------------------------------------------------------------
+# Jira REST v3 and Confluence Cloud v2 both take ADF. mcp-atlassian never
+# learned to build it, which is why "transition with a comment" failed there.
+
+_INLINE = re.compile(
+    r"(?P<code>`[^`]+`)"
+    r"|(?P<link>\[[^\]]+\]\([^)]+\))"
+    r"|(?P<bold>\*\*[^*]+\*\*)"
+    r"|(?P<italic>(?<![*\w])\*[^*\n]+\*(?![*\w]))"
+)
+
+
+def _inline_adf(text):
+    """Markdown inline spans -> a list of ADF text nodes."""
+    nodes, pos = [], 0
+
+    def push(s, marks=None):
+        if not s:
+            return
+        node = {"type": "text", "text": s}
+        if marks:
+            node["marks"] = marks
+        nodes.append(node)
+
+    for m in _INLINE.finditer(text):
+        push(text[pos:m.start()])
+        kind = m.lastgroup
+        raw = m.group()
+        if kind == "code":
+            push(raw[1:-1], [{"type": "code"}])
+        elif kind == "bold":
+            push(raw[2:-2], [{"type": "strong"}])
+        elif kind == "italic":
+            push(raw[1:-1], [{"type": "em"}])
+        elif kind == "link":
+            label, href = re.match(r"\[([^\]]+)\]\(([^)]+)\)", raw).groups()
+            push(label, [{"type": "link", "attrs": {"href": href}}])
+        pos = m.end()
+    push(text[pos:])
+    return nodes or [{"type": "text", "text": " "}]
+
+
+def md_to_adf(text):
+    """A pragmatic Markdown subset -> ADF doc.
+
+    Handles: headings, fenced code, bullet/ordered lists, blockquotes,
+    horizontal rules, paragraphs, and the inline marks above. Anything else
+    degrades to a plain paragraph rather than failing.
+    """
+    if not text:
+        text = " "
+    lines = text.replace("\r\n", "\n").split("\n")
+    content, i = [], 0
+
+    def para(buf):
+        if buf:
+            content.append({"type": "paragraph", "content": _inline_adf(" ".join(buf))})
+
+    buf = []
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            para(buf); buf = []
+            lang = stripped[3:].strip() or None
+            i += 1
+            code = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code.append(lines[i])
+                i += 1
+            i += 1
+            node = {"type": "codeBlock",
+                    "content": [{"type": "text", "text": "\n".join(code) or " "}]}
+            if lang:
+                node["attrs"] = {"language": lang}
+            content.append(node)
+            continue
+
+        h = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if h:
+            para(buf); buf = []
+            content.append({
+                "type": "heading",
+                "attrs": {"level": len(h.group(1))},
+                "content": _inline_adf(h.group(2)),
+            })
+            i += 1
+            continue
+
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", stripped):
+            para(buf); buf = []
+            content.append({"type": "rule"})
+            i += 1
+            continue
+
+        # table: a header row followed by a |---|---| separator
+        if (stripped.startswith("|") and i + 1 < len(lines)
+                and re.fullmatch(r"\|[\s:|-]+\|", lines[i + 1].strip() or "|")):
+            para(buf); buf = []
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if not re.fullmatch(r"[\s:-]*", "".join(cells)):
+                    rows.append(cells)
+                i += 1
+            width = max(len(r) for r in rows)
+            trows = []
+            for n, cells in enumerate(rows):
+                cells = cells + [""] * (width - len(cells))
+                kind = "tableHeader" if n == 0 else "tableCell"
+                trows.append({"type": "tableRow", "content": [
+                    {"type": kind, "attrs": {},
+                     "content": [{"type": "paragraph", "content": _inline_adf(c or " ")}]}
+                    for c in cells]})
+            content.append({"type": "table",
+                            "attrs": {"isNumberColumnEnabled": False,
+                                      "layout": "default"},
+                            "content": trows})
+            continue
+
+        li = re.match(r"^\s*([-*+]|\d+[.)])\s+(.*)$", line)
+        if li:
+            para(buf); buf = []
+            ordered = not li.group(1) in ("-", "*", "+")
+            items = []
+            while i < len(lines):
+                m2 = re.match(r"^\s*([-*+]|\d+[.)])\s+(.*)$", lines[i])
+                if not m2:
+                    break
+                is_ord = m2.group(1) not in ("-", "*", "+")
+                if is_ord != ordered:
+                    break
+                items.append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph",
+                                 "content": _inline_adf(m2.group(2))}],
+                })
+                i += 1
+            content.append({"type": "orderedList" if ordered else "bulletList",
+                            "content": items})
+            continue
+
+        if stripped.startswith(">"):
+            para(buf); buf = []
+            quote = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote.append(lines[i].strip().lstrip(">").strip())
+                i += 1
+            content.append({
+                "type": "blockquote",
+                "content": [{"type": "paragraph", "content": _inline_adf(" ".join(quote))}],
+            })
+            continue
+
+        if not stripped:
+            para(buf); buf = []
+            i += 1
+            continue
+
+        buf.append(stripped)
+        i += 1
+
+    para(buf)
+    if not content:
+        content = [{"type": "paragraph", "content": [{"type": "text", "text": " "}]}]
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def adf_to_md(node, depth=0):
+    """ADF -> Markdown. Lossy on exotic nodes, faithful on everything we emit."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_to_md(n, depth) for n in node)
+
+    t = node.get("type")
+    kids = node.get("content", []) or []
+
+    if t == "text":
+        s = node.get("text", "")
+        for mark in node.get("marks", []) or []:
+            mt = mark.get("type")
+            if mt == "code":
+                s = f"`{s}`"
+            elif mt == "strong":
+                s = f"**{s}**"
+            elif mt == "em":
+                s = f"*{s}*"
+            elif mt == "link":
+                s = f"[{s}]({mark.get('attrs', {}).get('href', '')})"
+        return s
+    if t == "hardBreak":
+        return "\n"
+    if t == "paragraph":
+        return adf_to_md(kids, depth) + "\n\n"
+    if t == "heading":
+        lvl = node.get("attrs", {}).get("level", 1)
+        return "#" * lvl + " " + adf_to_md(kids, depth) + "\n\n"
+    if t == "codeBlock":
+        lang = node.get("attrs", {}).get("language", "")
+        return f"```{lang}\n" + adf_to_md(kids, depth) + "\n```\n\n"
+    if t == "rule":
+        return "---\n\n"
+    if t in ("bulletList", "orderedList"):
+        out = []
+        for n, item in enumerate(kids, 1):
+            bullet = f"{n}. " if t == "orderedList" else "- "
+            inner = adf_to_md(item.get("content", []), depth + 1).strip()
+            pad = "  " * depth
+            first, *rest = inner.split("\n") or [""]
+            out.append(pad + bullet + first)
+            out.extend(pad + "  " + r for r in rest if r.strip())
+        return "\n".join(out) + "\n\n"
+    if t == "listItem":
+        return adf_to_md(kids, depth)
+    if t == "blockquote":
+        inner = adf_to_md(kids, depth).strip()
+        return "\n".join("> " + l for l in inner.split("\n")) + "\n\n"
+    if t in ("table",):
+        rows = []
+        for row in kids:
+            cells = [adf_to_md(c.get("content", []), depth).strip().replace("\n", " ")
+                     for c in row.get("content", []) or []]
+            rows.append("| " + " | ".join(cells) + " |")
+        if rows:
+            head = rows[0].count("|") - 1
+            rows.insert(1, "|" + "---|" * head)
+        return "\n".join(rows) + "\n\n"
+    if t == "mediaSingle" or t == "mediaGroup":
+        return "[media]\n\n"
+    if t == "mention":
+        return "@" + node.get("attrs", {}).get("text", "").lstrip("@")
+    if t == "emoji":
+        return node.get("attrs", {}).get("text", "")
+    if t == "doc":
+        return adf_to_md(kids, depth)
+    return adf_to_md(kids, depth)
+
+
+def flat(adf):
+    """One-line plain text — for list views."""
+    return " ".join(adf_to_md(adf).split())
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+DUR = re.compile(r"(?:(\d+)w)?\s*(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?$", re.I)
+
+
+def parse_duration(s):
+    """'2h30m' / '1d 4h' / '90m' -> seconds. Jira workday = 8h, week = 5d."""
+    s = s.strip()
+    if s.isdigit():
+        return int(s) * 60
+    m = DUR.match(s)
+    if not m or not any(m.groups()):
+        sys.exit(f"atl: cannot parse duration {s!r} (use forms like 2h30m, 1d, 45m)")
+    w, d, h, mi = (int(x) if x else 0 for x in m.groups())
+    return ((w * 5 + d) * 8 * 3600) + h * 3600 + mi * 60
+
+
+def fmt_duration(sec):
+    h, rem = divmod(int(sec), 3600)
+    m = rem // 60
+    if h and m:
+        return f"{h}h{m}m"
+    return f"{h}h" if h else f"{m}m"
+
+
+def local_offset():
+    return datetime.now(timezone.utc).astimezone().strftime("%z")
+
+
+def jira_datetime(day=None, time="12:00:00"):
+    """Jira wants 2026-06-24T12:40:00.000+0200 — naive ISO is rejected."""
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    return f"{day}T{time}.000{local_offset()}"
+
+
+def out_json(obj):
+    json.dump(obj, sys.stdout, ensure_ascii=False, indent=2)
+    print()
+
+
+def resolve_account(creds, who):
+    """Display name / email -> accountId. Jira silently ignores a bad one."""
+    if not who:
+        return None
+    if who in ("me", "self", "currentUser"):
+        return api(creds, "/rest/api/3/myself")["accountId"]
+    if re.fullmatch(r"[0-9a-f]{6,}:[0-9a-f-]{36}", who) or who.startswith("qm:"):
+        return who
+    hits = api(creds, "/rest/api/3/user/search", {"query": who, "maxResults": 10})
+    if not hits:
+        sys.exit(f"atl: no Jira user matches {who!r}")
+    exact = [u for u in hits
+             if who.lower() in (str(u.get("displayName", "")).lower(),
+                                str(u.get("emailAddress", "")).lower())]
+    pick = (exact or hits)[0]
+    if len(exact or hits) > 1 and not exact:
+        names = ", ".join(f"{u.get('displayName')} <{u.get('emailAddress')}>" for u in hits[:5])
+        sys.exit(f"atl: {who!r} is ambiguous: {names}")
+    return pick["accountId"]
+
+
+# --------------------------------------------------------------------------
+# Jira: read
+# --------------------------------------------------------------------------
+
+BRIEF_FIELDS = "summary,status,assignee,issuetype,priority,parent,duedate,timetracking"
+
+
+def cmd_init(_creds_unused, a):
+    """Write ~/.atl.json interactively. Never echoes the token."""
+    import getpass
+
+    existing = {}
+    if os.path.exists(ATL_CONFIG):
+        try:
+            with open(ATL_CONFIG) as f:
+                existing = json.load(f)
+        except ValueError:
+            pass
+        if not a.force:
+            sys.exit(f"atl: {ATL_CONFIG} already exists; pass --force to overwrite")
+
+    def ask(prompt, default=""):
+        shown = f" [{default}]" if default else ""
+        got = input(f"{prompt}{shown}: ").strip()
+        return got or default
+
+    print("Create an API token at "
+          "https://id.atlassian.com/manage-profile/security/api-tokens\n")
+    url = ask("Site URL (https://you.atlassian.net)", existing.get("url", ""))
+    user = ask("Account email", existing.get("user", ""))
+    token = getpass.getpass("API token (input hidden): ").strip() \
+        or existing.get("token", "")
+    if not (url and user and token):
+        sys.exit("atl: url, user and token are all required")
+
+    url = url.rstrip("/")
+    cfg = {"url": url, "user": user, "token": token,
+           "confluence_url": ask("Confluence base URL", url + "/wiki").rstrip("/")}
+
+    tmp = ATL_CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ATL_CONFIG)
+    print(f"\nwrote {ATL_CONFIG} (mode 600)")
+
+    try:
+        who = api(cfg, "/rest/api/3/myself")
+        print(f"authenticated as {who.get('displayName')} <{who.get('emailAddress')}>")
+    except ApiError as e:
+        print(f"warning: credentials written but the check call failed — {e.status}")
+
+
+def cmd_me(creds, a):
+    u = api(creds, "/rest/api/3/myself")
+    if a.json:
+        return out_json(u)
+    print(f"{u.get('displayName')} <{u.get('emailAddress')}>")
+    print(f"accountId: {u.get('accountId')}")
+    print(f"site:      {creds['url']}")
+
+
+def _issue_line(i):
+    f = i.get("fields", {})
+    st = (f.get("status") or {}).get("name", "?")
+    who = (f.get("assignee") or {}).get("displayName", "—")
+    typ = (f.get("issuetype") or {}).get("name", "?")
+    return f"{i['key']:<10} {st:<14} {typ:<8} {who:<20} {f.get('summary', '')}"
+
+
+def cmd_issue(creds, a):
+    fields = a.fields or ("*all" if a.full else BRIEF_FIELDS + ",description,reporter,labels,components,fixVersions,created,updated,resolution")
+    i = api(creds, f"/rest/api/3/issue/{a.key}", {"fields": fields})
+    if a.json:
+        return out_json(i)
+    f = i["fields"]
+    print(f"{i['key']}  {f.get('summary', '')}")
+    def nm(field, attr="name"):
+        return (f.get(field) or {}).get(attr) or "—"
+
+    print(f"  status:   {nm('status')}   type: {nm('issuetype')}   prio: {nm('priority')}")
+    print(f"  assignee: {nm('assignee', 'displayName')}"
+          f"   reporter: {nm('reporter', 'displayName')}")
+    if f.get("parent"):
+        print(f"  parent:   {f['parent']['key']}  {f['parent']['fields']['summary']}")
+    if f.get("labels"):
+        print(f"  labels:   {', '.join(f['labels'])}")
+    tt = f.get("timetracking") or {}
+    if tt:
+        print(f"  time:     spent {tt.get('timeSpent', '0')}"
+              f"  est {tt.get('originalEstimate', '—')}")
+    print(f"  url:      {creds['url']}/browse/{i['key']}")
+    desc = adf_to_md(f.get("description")).strip()
+    if desc:
+        print("\n--- description ---")
+        print(desc)
+    for name, val in sorted(f.items()):
+        if not name.startswith("customfield_") or val is None:
+            continue
+        if a.full:
+            rendered = adf_to_md(val).strip() if isinstance(val, dict) and val.get("type") == "doc" else str(val)
+            if rendered and rendered != "None":
+                print(f"\n--- {name} ---\n{rendered[:2000]}")
+
+
+def cmd_search(creds, a):
+    fields = a.fields or BRIEF_FIELDS
+    rows, token, seen = [], None, 0
+    while True:
+        params = {"jql": a.jql, "fields": fields, "maxResults": min(100, a.limit - seen)}
+        if token:
+            params["nextPageToken"] = token
+        data = api(creds, "/rest/api/3/search/jql", params)
+        batch = data.get("issues", [])
+        rows.extend(batch)
+        seen += len(batch)
+        token = data.get("nextPageToken")
+        if not token or data.get("isLast") or seen >= a.limit or not batch:
+            break
+    if a.json:
+        return out_json(rows)
+    for i in rows:
+        print(_issue_line(i))
+    print(f"\n{len(rows)} issue(s)")
+
+
+def cmd_comments(creds, a):
+    data = api(creds, f"/rest/api/3/issue/{a.key}/comment",
+               {"maxResults": a.limit, "orderBy": "-created"})
+    if a.json:
+        return out_json(data)
+    for c in data.get("comments", []):
+        who = (c.get("author") or {}).get("displayName", "?")
+        when = c.get("created", "")[:16].replace("T", " ")
+        print(f"[{c['id']}] {when}  {who}")
+        print("   " + adf_to_md(c.get("body")).strip().replace("\n", "\n   "))
+        print()
+    print(f"{data.get('total', 0)} comment(s)")
+
+
+def cmd_transitions(creds, a):
+    data = api(creds, f"/rest/api/3/issue/{a.key}/transitions")
+    if a.json:
+        return out_json(data)
+    for t in data.get("transitions", []):
+        print(f"{t['id']:<6} {t['name']:<28} -> {t['to']['name']}")
+
+
+def cmd_attachments(creds, a):
+    i = api(creds, f"/rest/api/3/issue/{a.key}", {"fields": "attachment"})
+    atts = i["fields"].get("attachment", []) or []
+    if a.json:
+        return out_json(atts)
+    for at in atts:
+        size = at.get("size", 0) / 1024
+        print(f"{at['id']:<10} {size:8.0f} KB  {at.get('created','')[:10]}  {at['filename']}")
+    print(f"{len(atts)} attachment(s)")
+
+
+# --------------------------------------------------------------------------
+# Jira: write
+# --------------------------------------------------------------------------
+
+def _find_ac_field(creds, project, issuetype):
+    """Acceptance Criteria is a custom field whose id differs per site."""
+    meta = api(creds, "/rest/api/3/issue/createmeta",
+               {"projectKeys": project, "expand": "projects.issuetypes.fields"})
+    for p in meta.get("projects", []):
+        for it in p.get("issuetypes", []):
+            if issuetype and it["name"].lower() != issuetype.lower():
+                continue
+            for fid, spec in it.get("fields", {}).items():
+                if "acceptance" in spec.get("name", "").lower():
+                    return fid
+    return None
+
+
+def cmd_create(creds, a):
+    fields = {
+        "project": {"key": a.project},
+        "summary": a.summary,
+        "issuetype": {"name": a.type},
+    }
+    if a.description:
+        fields["description"] = md_to_adf(_maybe_file(a.description))
+    if a.ac:
+        fid = a.ac_field or _find_ac_field(creds, a.project, a.type)
+        if not fid:
+            sys.exit("atl: no Acceptance Criteria field on this project; pass --ac-field")
+        fields[fid] = md_to_adf(_maybe_file(a.ac))
+    if a.assignee:
+        fields["assignee"] = {"id": resolve_account(creds, a.assignee)}
+    if a.parent:
+        fields["parent"] = {"key": a.parent}
+    if a.labels:
+        fields["labels"] = a.labels
+    if a.priority:
+        fields["priority"] = {"name": a.priority}
+    if a.sprint:
+        fields[a.sprint_field or resolve_sprint_field(creds)] = int(a.sprint)
+    for kv in a.field or []:
+        k, _, v = kv.partition("=")
+        fields[k] = _coerce(v)
+
+    res = api(creds, "/rest/api/3/issue", method="POST", body={"fields": fields})
+    if a.json:
+        return out_json(res)
+    print(f"{res['key']}  {creds['url']}/browse/{res['key']}")
+
+
+def _coerce(v):
+    """--field customfield_1=10 -> int; ={"a":1} -> dict; else str."""
+    v = v.strip()
+    if v.startswith(("{", "[")):
+        return json.loads(v)
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+
+def _maybe_file(s):
+    """'@path.md' reads the file — keeps long bodies off the command line."""
+    if s.startswith("@"):
+        with open(os.path.expanduser(s[1:])) as f:
+            return f.read()
+    return s
+
+
+def cmd_edit(creds, a):
+    fields = {}
+    if a.summary:
+        fields["summary"] = a.summary
+    if a.description:
+        fields["description"] = md_to_adf(_maybe_file(a.description))
+    if a.ac:
+        fid = a.ac_field
+        if not fid:
+            i = api(creds, f"/rest/api/3/issue/{a.key}", {"fields": "project,issuetype"})
+            fid = _find_ac_field(creds, i["fields"]["project"]["key"],
+                                 i["fields"]["issuetype"]["name"])
+        if not fid:
+            sys.exit("atl: no Acceptance Criteria field found; pass --ac-field")
+        fields[fid] = md_to_adf(_maybe_file(a.ac))
+    if a.assignee:
+        fields["assignee"] = {"id": resolve_account(creds, a.assignee)}
+    if a.labels:
+        fields["labels"] = a.labels
+    if a.priority:
+        fields["priority"] = {"name": a.priority}
+    if a.sprint:
+        fields[a.sprint_field or resolve_sprint_field(creds)] = int(a.sprint)
+    for kv in a.field or []:
+        k, _, v = kv.partition("=")
+        fields[k] = _coerce(v)
+    if not fields:
+        sys.exit("atl: nothing to edit")
+    api(creds, f"/rest/api/3/issue/{a.key}", method="PUT", body={"fields": fields})
+    print(f"{a.key} updated: {', '.join(fields)}")
+
+
+def cmd_transition(creds, a):
+    data = api(creds, f"/rest/api/3/issue/{a.key}/transitions")
+    trans = data.get("transitions", [])
+    pick = None
+    if a.id:
+        pick = next((t for t in trans if t["id"] == str(a.id)), None)
+    else:
+        want = a.to.lower()
+        pick = next((t for t in trans if t["to"]["name"].lower() == want), None) \
+            or next((t for t in trans if t["name"].lower() == want), None) \
+            or next((t for t in trans if want in t["to"]["name"].lower()), None)
+    if not pick:
+        avail = ", ".join(f"{t['name']}->{t['to']['name']}" for t in trans)
+        sys.exit(f"atl: no transition to {a.to or a.id!r} from here. Available: {avail}")
+
+    api(creds, f"/rest/api/3/issue/{a.key}/transitions", method="POST",
+        body={"transition": {"id": pick["id"]}})
+    print(f"{a.key} -> {pick['to']['name']}  (via '{pick['name']}', id {pick['id']})")
+
+    # mcp-atlassian could not do this in one step; here it is just a second call.
+    if a.comment:
+        api(creds, f"/rest/api/3/issue/{a.key}/comment", method="POST",
+            body={"body": md_to_adf(_maybe_file(a.comment))})
+        print(f"{a.key} comment added")
+
+
+def cmd_comment(creds, a):
+    res = api(creds, f"/rest/api/3/issue/{a.key}/comment", method="POST",
+              body={"body": md_to_adf(_maybe_file(a.text))})
+    print(f"{a.key} comment {res['id']} added")
+
+
+def cmd_assign(creds, a):
+    acc = resolve_account(creds, a.who) if a.who not in ("none", "unassigned") else None
+    api(creds, f"/rest/api/3/issue/{a.key}/assignee", method="PUT",
+        body={"accountId": acc})
+    print(f"{a.key} assigned to {a.who}")
+
+
+def cmd_link(creds, a):
+    api(creds, "/rest/api/3/issueLink", method="POST", body={
+        "type": {"name": a.type},
+        "inwardIssue": {"key": a.to},
+        "outwardIssue": {"key": a.key},
+    })
+    print(f"{a.key} --{a.type}--> {a.to}")
+
+
+def cmd_delete(creds, a):
+    api(creds, f"/rest/api/3/issue/{a.key}",
+        params={"deleteSubtasks": "true"} if a.subtasks else None, method="DELETE")
+    print(f"{a.key} deleted")
+
+
+def cmd_comment_edit(creds, a):
+    api(creds, f"/rest/api/3/issue/{a.key}/comment/{a.id}", method="PUT",
+        body={"body": md_to_adf(_maybe_file(a.text))})
+    print(f"{a.key} comment {a.id} updated")
+
+
+def cmd_comment_rm(creds, a):
+    api(creds, f"/rest/api/3/issue/{a.key}/comment/{a.id}", method="DELETE")
+    print(f"{a.key} comment {a.id} deleted")
+
+
+# --------------------------------------------------------------------------
+# Jira: sprints (write)
+# --------------------------------------------------------------------------
+
+def _active_sprint(creds, board):
+    d = api(creds, f"/rest/agile/1.0/board/{board}/sprint",
+            {"state": "active", "maxResults": 50})
+    vals = d.get("values", [])
+    if not vals:
+        sys.exit(f"atl: board {board} has no active sprint")
+    return vals[0]
+
+
+def cmd_sprint_current(creds, a):
+    sp = _active_sprint(creds, a.board)
+    if a.json:
+        return out_json(sp)
+    print(f"{sp['id']}  {sp['name']}  "
+          f"{sp.get('startDate','')[:10]} … {sp.get('endDate','')[:10]}")
+
+
+def cmd_sprint_add(creds, a):
+    """Move work items into a sprint. `--board N` resolves the active sprint."""
+    sprint = a.sprint
+    if sprint in ("current", "active"):
+        if not a.board:
+            sys.exit("atl: --board is required with sprint 'current'")
+        sprint = _active_sprint(creds, a.board)["id"]
+    keys = list(a.keys)
+    # the Agile API caps a single call at 50 issues
+    for chunk in [keys[i:i + 50] for i in range(0, len(keys), 50)]:
+        api(creds, f"/rest/agile/1.0/sprint/{sprint}/issue", method="POST",
+            body={"issues": chunk})
+    print(f"{len(keys)} issue(s) -> sprint {sprint}: {', '.join(keys)}")
+
+
+def cmd_sprint_backlog(creds, a):
+    keys = list(a.keys)
+    for chunk in [keys[i:i + 50] for i in range(0, len(keys), 50)]:
+        api(creds, "/rest/agile/1.0/backlog/issue", method="POST",
+            body={"issues": chunk})
+    print(f"{len(keys)} issue(s) -> backlog: {', '.join(keys)}")
+
+
+def cmd_sprint_issues(creds, a):
+    sprint = a.sprint
+    if sprint in ("current", "active"):
+        if not a.board:
+            sys.exit("atl: --board is required with sprint 'current'")
+        sprint = _active_sprint(creds, a.board)["id"]
+    d = api(creds, f"/rest/agile/1.0/sprint/{sprint}/issue",
+            {"fields": BRIEF_FIELDS, "maxResults": a.limit})
+    issues = d.get("issues", [])
+    if a.json:
+        return out_json(issues)
+    for i in issues:
+        print(_issue_line(i))
+    print(f"\n{len(issues)} issue(s) in sprint {sprint}")
+
+
+def cmd_sprint_create(creds, a):
+    body = {"name": a.name, "originBoardId": int(a.board)}
+    if a.start:
+        body["startDate"] = jira_datetime(a.start, "09:00:00")
+    if a.end:
+        body["endDate"] = jira_datetime(a.end, "18:00:00")
+    if a.goal:
+        body["goal"] = a.goal
+    res = api(creds, "/rest/agile/1.0/sprint", method="POST", body=body)
+    print(f"{res['id']}  {res['name']}  ({res['state']})")
+
+
+def cmd_sprint_update(creds, a):
+    body = {}
+    for k, v in (("name", a.name), ("goal", a.goal), ("state", a.state)):
+        if v:
+            body[k] = v
+    if a.start:
+        body["startDate"] = jira_datetime(a.start, "09:00:00")
+    if a.end:
+        body["endDate"] = jira_datetime(a.end, "18:00:00")
+    if not body:
+        sys.exit("atl: nothing to change")
+    res = api(creds, f"/rest/agile/1.0/sprint/{a.sprint}", method="POST", body=body)
+    print(f"sprint {res['id']} updated: {', '.join(body)}")
+
+
+# --------------------------------------------------------------------------
+# Jira: worklogs  (mcp-atlassian had no delete/edit here at all)
+# --------------------------------------------------------------------------
+
+def _worklogs(creds, key):
+    out, start_at = [], 0
+    while True:
+        d = api(creds, f"/rest/api/3/issue/{key}/worklog",
+                {"startAt": start_at, "maxResults": 100})
+        out.extend(d.get("worklogs", []))
+        start_at += d.get("maxResults", 0) or 100
+        if start_at >= d.get("total", 0):
+            return out
+
+
+def cmd_worklog_list(creds, a):
+    logs = _worklogs(creds, a.key)
+    if a.mine:
+        acc = api(creds, "/rest/api/3/myself")["accountId"]
+        logs = [w for w in logs if (w.get("author") or {}).get("accountId") == acc]
+    if a.json:
+        return out_json(logs)
+    total = 0
+    for w in sorted(logs, key=lambda w: w.get("started", "")):
+        total += w["timeSpentSeconds"]
+        who = (w.get("author") or {}).get("displayName", "?")
+        print(f"{w['id']:<10} {w['started'][:10]}  {w['timeSpent']:>7}  "
+              f"{who:<20} {flat(w.get('comment'))[:60]}")
+    print(f"\n{len(logs)} worklog(s), {fmt_duration(total)} total")
+
+
+def cmd_worklog_add(creds, a):
+    body = {
+        "timeSpentSeconds": parse_duration(a.time),
+        "started": jira_datetime(a.date, a.at),
+    }
+    if a.comment:
+        body["comment"] = md_to_adf(_maybe_file(a.comment))
+    res = api(creds, f"/rest/api/3/issue/{a.key}/worklog", method="POST", body=body,
+              params={"notifyUsers": "false"})
+    print(f"{a.key} +{fmt_duration(body['timeSpentSeconds'])} on "
+          f"{body['started'][:10]}  (worklog {res['id']})")
+
+
+def cmd_worklog_edit(creds, a):
+    body = {}
+    if a.time:
+        body["timeSpentSeconds"] = parse_duration(a.time)
+    if a.date or a.at != "12:00:00":
+        body["started"] = jira_datetime(a.date, a.at)
+    if a.comment:
+        body["comment"] = md_to_adf(_maybe_file(a.comment))
+    if not body:
+        sys.exit("atl: nothing to change")
+    api(creds, f"/rest/api/3/issue/{a.key}/worklog/{a.id}", method="PUT", body=body,
+        params={"notifyUsers": "false"})
+    print(f"{a.key} worklog {a.id} updated: {', '.join(body)}")
+
+
+def cmd_worklog_rm(creds, a):
+    api(creds, f"/rest/api/3/issue/{a.key}/worklog/{a.id}", method="DELETE",
+        params={"notifyUsers": "false"})
+    print(f"{a.key} worklog {a.id} deleted")
+
+
+# --------------------------------------------------------------------------
+# Jira: attachments  (mcp-atlassian could only download, never upload)
+# --------------------------------------------------------------------------
+
+def cmd_attach(creds, a):
+    for path in a.files:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            sys.exit(f"atl: no such file: {path}")
+        res = upload(creds, f"/rest/api/3/issue/{a.key}/attachments", path)
+        for at in res if isinstance(res, list) else [res]:
+            print(f"{a.key} + {at['filename']}  (id {at['id']}, "
+                  f"{at.get('size', 0)/1024:.0f} KB)")
+
+
+def cmd_attach_rm(creds, a):
+    api(creds, f"/rest/api/3/attachment/{a.id}", method="DELETE")
+    print(f"attachment {a.id} deleted")
+
+
+def cmd_download(creds, a):
+    i = api(creds, f"/rest/api/3/issue/{a.key}", {"fields": "attachment"})
+    atts = i["fields"].get("attachment", []) or []
+    if a.name:
+        atts = [x for x in atts if a.name.lower() in x["filename"].lower()]
+    os.makedirs(a.dest, exist_ok=True)
+    for at in atts:
+        blob = api(creds, urllib.parse.urlparse(at["content"]).path, raw=True)
+        dst = os.path.join(a.dest, at["filename"])
+        with open(dst, "wb") as f:
+            f.write(blob)
+        print(f"{dst}  ({len(blob)/1024:.0f} KB)")
+
+
+# --------------------------------------------------------------------------
+# Jira: boards / sprints
+# --------------------------------------------------------------------------
+
+def cmd_boards(creds, a):
+    params = {"maxResults": 100}
+    if a.project:
+        params["projectKeyOrId"] = a.project
+    d = api(creds, "/rest/agile/1.0/board", params)
+    if a.json:
+        return out_json(d.get("values", []))
+    for b in d.get("values", []):
+        loc = (b.get("location") or {}).get("projectKey", "")
+        print(f"{b['id']:<6} {b['type']:<8} {loc:<8} {b['name']}")
+
+
+def cmd_sprints(creds, a):
+    params = {"maxResults": 100}
+    if a.state:
+        params["state"] = a.state
+    d = api(creds, f"/rest/agile/1.0/board/{a.board}/sprint", params)
+    if a.json:
+        return out_json(d.get("values", []))
+    for s in d.get("values", []):
+        print(f"{s['id']:<8} {s['state']:<8} {s.get('startDate','')[:10]:<12}"
+              f"{s.get('endDate','')[:10]:<12} {s['name']}")
+
+
+def cmd_projects(creds, a):
+    d = api(creds, "/rest/api/3/project/search", {"maxResults": 100})
+    if a.json:
+        return out_json(d.get("values", []))
+    for p in d.get("values", []):
+        print(f"{p['key']:<10} {p.get('projectTypeKey',''):<10} {p['name']}")
+
+
+def cmd_fields(creds, a):
+    d = api(creds, "/rest/api/3/field")
+    if a.json:
+        return out_json(d)
+    q = (a.query or "").lower()
+    for f in d:
+        if q and q not in f["name"].lower() and q not in f["id"].lower():
+            continue
+        print(f"{f['id']:<24} {f['name']}")
+
+
+# --------------------------------------------------------------------------
+# Confluence  (Cloud v2 speaks ADF, so the same converter serves both)
+# --------------------------------------------------------------------------
+
+def cmd_conf_get(creds, a):
+    p = api(creds, f"/api/v2/pages/{a.id}",
+            {"body-format": "atlas_doc_format"}, base=creds["confluence_url"])
+    body = p.get("body", {}).get("atlas_doc_format", {}).get("value")
+    doc = json.loads(body) if isinstance(body, str) else body
+    if a.json:
+        return out_json(p)
+    if a.meta:
+        print(f"id:      {p['id']}")
+        print(f"title:   {p['title']}")
+        print(f"space:   {p.get('spaceId')}")
+        print(f"version: {p.get('version', {}).get('number')}")
+        print(f"url:     {creds['confluence_url']}/spaces/_/pages/{p['id']}")
+        return
+    print(f"# {p['title']}\n")
+    print(adf_to_md(doc).strip())
+
+
+def cmd_conf_put(creds, a):
+    cur = api(creds, f"/api/v2/pages/{a.id}", {"body-format": "storage"},
+              base=creds["confluence_url"])
+    md = _maybe_file(a.body if a.body.startswith("@") else "@" + a.body) \
+        if a.body else sys.stdin.read()
+    title = a.title or cur["title"]
+    body = {
+        "id": str(a.id),
+        "status": "current",
+        "title": title,
+        "version": {"number": cur["version"]["number"] + 1,
+                    "message": a.message or "updated via atl"},
+        "body": {"representation": "atlas_doc_format",
+                 "value": json.dumps(md_to_adf(md))},
+    }
+    res = api(creds, f"/api/v2/pages/{a.id}", method="PUT", body=body,
+              base=creds["confluence_url"])
+    print(f"page {res['id']} -> v{res['version']['number']}  {res['title']}")
+
+
+def cmd_conf_create(creds, a):
+    md = _maybe_file(a.body if a.body.startswith("@") else "@" + a.body) \
+        if a.body else sys.stdin.read()
+    space_id = a.space_id
+    if not space_id:
+        sp = api(creds, "/api/v2/spaces", {"keys": a.space},
+                 base=creds["confluence_url"])
+        vals = sp.get("results", [])
+        if not vals:
+            sys.exit(f"atl: no Confluence space with key {a.space!r}")
+        space_id = vals[0]["id"]
+    body = {
+        "spaceId": str(space_id),
+        "status": "current",
+        "title": a.title,
+        "body": {"representation": "atlas_doc_format",
+                 "value": json.dumps(md_to_adf(md))},
+    }
+    if a.parent:
+        body["parentId"] = str(a.parent)
+    res = api(creds, "/api/v2/pages", method="POST", body=body,
+              base=creds["confluence_url"])
+    print(f"{res['id']}  {creds['confluence_url']}{res['_links']['webui']}")
+
+
+def cmd_conf_search(creds, a):
+    d = api(creds, "/rest/api/content/search",
+            {"cql": a.cql, "limit": a.limit, "expand": "space,version"},
+            base=creds["confluence_url"])
+    if a.json:
+        return out_json(d.get("results", []))
+    for r in d.get("results", []):
+        sp = (r.get("space") or {}).get("key", "")
+        print(f"{r['id']:<12} {r['type']:<6} {sp:<8} {r['title']}")
+    print(f"\n{d.get('size', 0)} result(s)")
+
+
+def cmd_conf_delete(creds, a):
+    api(creds, f"/api/v2/pages/{a.id}", method="DELETE", base=creds["confluence_url"])
+    print(f"page {a.id} deleted")
+
+
+def cmd_conf_children(creds, a):
+    d = api(creds, f"/api/v2/pages/{a.id}/children", {"limit": 250},
+            base=creds["confluence_url"])
+    if a.json:
+        return out_json(d.get("results", []))
+    for c in d.get("results", []):
+        print(f"{c['id']:<12} {c['title']}")
+
+
+def cmd_conf_spaces(creds, a):
+    d = api(creds, "/api/v2/spaces", {"limit": 250}, base=creds["confluence_url"])
+    if a.json:
+        return out_json(d.get("results", []))
+    for s in d.get("results", []):
+        print(f"{s['key']:<12} {s['id']:<12} {s['name']}")
+
+
+def _conf_comment_line(c):
+    ver = c.get("version", {}) or {}
+    who = (ver.get("authorId") or "")[:12]
+    when = (ver.get("createdAt") or "")[:16].replace("T", " ")
+    return c["id"], when, who
+
+
+def cmd_conf_comments(creds, a):
+    """Footer comments plus, unless --footer-only, the inline ones."""
+    kinds = ["footer-comments"] if a.footer_only else ["footer-comments", "inline-comments"]
+    rows = []
+    for kind in kinds:
+        d = api(creds, f"/api/v2/pages/{a.id}/{kind}",
+                {"body-format": "atlas_doc_format", "limit": a.limit},
+                base=creds["confluence_url"])
+        for c in d.get("results", []):
+            c["_kind"] = kind.split("-")[0]
+            c["_depth"] = 0
+            rows.append(c)
+            # v2 returns only top-level comments; replies live under /children
+            rows.extend(_conf_replies(creds, kind, c["id"], 1))
+    if a.json:
+        return out_json(rows)
+
+    names = _account_names(creds, {(c.get("version") or {}).get("authorId") for c in rows})
+    for c in rows:
+        cid, when, who = _conf_comment_line(c)
+        author = names.get((c.get("version") or {}).get("authorId"), who or "?")
+        body = c.get("body", {}).get("atlas_doc_format", {}).get("value")
+        doc = json.loads(body) if isinstance(body, str) else body
+        pad = "    " * c.get("_depth", 0)
+        arrow = "↳ " if c.get("_depth") else ""
+        print(f"{pad}{arrow}[{cid}] {c['_kind']:<6} {when}  {author}")
+        text = adf_to_md(doc).strip().replace("\n", "\n" + pad + "   ")
+        print(f"{pad}   {text}")
+        print()
+    print(f"{len(rows)} comment(s)")
+
+
+def _conf_replies(creds, kind, comment_id, depth, limit=50):
+    """Replies to one comment, depth-first. Threads are usually one level deep."""
+    try:
+        d = api(creds, f"/api/v2/{kind}/{comment_id}/children",
+                {"body-format": "atlas_doc_format", "limit": limit},
+                base=creds["confluence_url"])
+    except ApiError:
+        return []
+    out = []
+    for c in d.get("results", []):
+        c["_kind"] = kind.split("-")[0]
+        c["_depth"] = depth
+        out.append(c)
+        if depth < 5:
+            out.extend(_conf_replies(creds, kind, c["id"], depth + 1, limit))
+    return out
+
+
+def _account_names(creds, account_ids):
+    """accountId -> display name. Confluence v2 only returns the raw ids."""
+    ids = [i for i in account_ids if i]
+    if not ids:
+        return {}
+
+    def one(acc):
+        try:
+            u = api(creds, "/rest/api/3/user", {"accountId": acc})
+            return acc, u.get("displayName", acc)
+        except ApiError:
+            return acc, acc
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(pool.map(one, ids))
+
+
+def cmd_conf_comment(creds, a):
+    body = {"pageId": str(a.id),
+            "body": {"representation": "atlas_doc_format",
+                     "value": json.dumps(md_to_adf(_maybe_file(a.text)))}}
+    res = api(creds, "/api/v2/footer-comments", method="POST", body=body,
+              base=creds["confluence_url"])
+    print(f"page {a.id} comment {res['id']} added")
+
+
+def cmd_conf_reply(creds, a):
+    body = {"parentCommentId": str(a.comment_id),
+            "body": {"representation": "atlas_doc_format",
+                     "value": json.dumps(md_to_adf(_maybe_file(a.text)))}}
+    res = api(creds, "/api/v2/footer-comments", method="POST", body=body,
+              base=creds["confluence_url"])
+    print(f"reply {res['id']} added under comment {a.comment_id}")
+
+
+def cmd_conf_history(creds, a):
+    d = api(creds, f"/api/v2/pages/{a.id}/versions",
+            {"limit": a.limit}, base=creds["confluence_url"])
+    vers = d.get("results", [])
+    if a.json:
+        return out_json(vers)
+    names = _account_names(creds, {v.get("authorId") for v in vers})
+    for v in vers:
+        who = names.get(v.get("authorId"), v.get("authorId", "?"))
+        print(f"v{v['number']:<4} {v.get('createdAt','')[:16].replace('T',' ')}  "
+              f"{who:<22} {v.get('message') or ''}")
+    print(f"\n{len(vers)} version(s)")
+
+
+def _page_version_md(creds, page_id, number):
+    """One historical version's body, as Markdown. v2 has no ?version, v1 does."""
+    d = api(creds, f"/rest/api/content/{page_id}",
+            {"version": number, "expand": "body.atlas_doc_format"},
+            base=creds["confluence_url"])
+    raw = d.get("body", {}).get("atlas_doc_format", {}).get("value")
+    doc = json.loads(raw) if isinstance(raw, str) else raw
+    return adf_to_md(doc)
+
+
+def cmd_conf_diff(creds, a):
+    """Unified diff between two versions, rendered on the Markdown form."""
+    import difflib
+    if not a.to:
+        cur = api(creds, f"/api/v2/pages/{a.id}", base=creds["confluence_url"])
+        a.to = cur["version"]["number"]
+    a.to = int(a.to)
+    a.from_ = int(a.from_) if a.from_ else max(1, a.to - 1)
+
+    old = _page_version_md(creds, a.id, a.from_).splitlines()
+    new = _page_version_md(creds, a.id, a.to).splitlines()
+    diff = list(difflib.unified_diff(old, new,
+                                     fromfile=f"v{a.from_}", tofile=f"v{a.to}",
+                                     lineterm="", n=a.context))
+    if not diff:
+        print(f"v{a.from_} and v{a.to} are identical")
+        return
+    print("\n".join(diff))
+
+
+def cmd_conf_labels(creds, a):
+    d = api(creds, f"/api/v2/pages/{a.id}/labels", {"limit": 250},
+            base=creds["confluence_url"])
+    if a.json:
+        return out_json(d.get("results", []))
+    for l in d.get("results", []):
+        print(f"{l.get('prefix','global'):<8} {l['name']}")
+
+
+def cmd_conf_label_add(creds, a):
+    api(creds, f"/rest/api/content/{a.id}/label", method="POST",
+        body=[{"prefix": "global", "name": n} for n in a.names],
+        base=creds["confluence_url"])
+    print(f"page {a.id} + labels: {', '.join(a.names)}")
+
+
+def cmd_conf_attach(creds, a):
+    """Confluence attachments still live on the v1 API."""
+    for path in a.files:
+        path = os.path.expanduser(path)
+        res = upload(creds, f"/rest/api/content/{a.id}/child/attachment", path,
+                     base=creds["confluence_url"])
+        for r in res.get("results", [res]):
+            print(f"page {a.id} + {r.get('title', os.path.basename(path))}")
+
+
+def cmd_report(creds, a):
+    """Delegate to the existing per-day worklog report."""
+    script = os.path.join(HOME, ".claude/skills/jira-worklog-report/worklog_report.py")
+    if not os.path.exists(script):
+        sys.exit(f"atl: {script} not found")
+    os.execv(sys.executable, [sys.executable, script] + a.rest)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+class _SubParser(argparse.ArgumentParser):
+    """Subparser that hands `--json` down to its own sub-subparsers too."""
+
+    common = None
+
+    def add_subparsers(self, **kw):
+        kw.setdefault("parser_class", _SubParser)
+        group = super().add_subparsers(**kw)
+        orig = group.add_parser
+
+        def add_parser(name, **kw2):
+            parents = list(kw2.pop("parents", []))
+            if _SubParser.common is not None:
+                parents.append(_SubParser.common)
+            return orig(name, parents=parents, **kw2)
+
+        group.add_parser = add_parser
+        return group
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="atl", description="Token-efficient CLI for Jira + Confluence Cloud")
+    p.add_argument("--json", action="store_true",
+                   help="raw API JSON instead of the compact view")
+    p.add_argument("--version", action="version", version=f"atl {__version__}")
+
+    # `--json` is accepted both before and after the subcommand — argparse only
+    # gives you the former unless every subparser inherits the flag too.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=None,
+                        help=argparse.SUPPRESS)
+
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=_SubParser)
+    _SubParser.common = common
+
+    def add(name, fn, help_=""):
+        s = sub.add_parser(name, help=help_, parents=[common])
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("init", cmd_init, "write ~/.atl.json interactively")
+    s.add_argument("--force", action="store_true", help="overwrite an existing config")
+
+    add("me", cmd_me, "who the token belongs to")
+
+    s = add("issue", cmd_issue, "show one work item")
+    s.add_argument("key")
+    s.add_argument("--full", action="store_true", help="all fields incl. custom")
+    s.add_argument("--fields", help="comma-separated field list")
+
+    s = add("search", cmd_search, "JQL search")
+    s.add_argument("jql")
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--fields", help="comma-separated field list")
+
+    s = add("create", cmd_create, "create a work item")
+    s.add_argument("--project", required=True)
+    s.add_argument("--type", default="Task")
+    s.add_argument("--summary", required=True)
+    s.add_argument("--description", help="Markdown, or @file.md")
+    s.add_argument("--ac", help="acceptance criteria: Markdown or @file.md")
+    s.add_argument("--ac-field", help="override the AC custom field id")
+    s.add_argument("--assignee")
+    s.add_argument("--parent")
+    s.add_argument("--labels", nargs="*")
+    s.add_argument("--priority")
+    s.add_argument("--sprint", help="sprint id")
+    s.add_argument("--sprint-field", help="override the Sprint custom field id")
+    s.add_argument("--field", action="append", help="raw field, e.g. customfield_1=10")
+
+    s = add("edit", cmd_edit, "edit a work item")
+    s.add_argument("key")
+    s.add_argument("--summary")
+    s.add_argument("--description")
+    s.add_argument("--ac")
+    s.add_argument("--ac-field")
+    s.add_argument("--assignee")
+    s.add_argument("--labels", nargs="*")
+    s.add_argument("--priority")
+    s.add_argument("--sprint")
+    s.add_argument("--sprint-field", help="override the Sprint custom field id")
+    s.add_argument("--field", action="append")
+
+    s = add("transitions", cmd_transitions, "list transitions available right now")
+    s.add_argument("key")
+
+    s = add("transition", cmd_transition, "move a work item; --comment works too")
+    s.add_argument("key")
+    s.add_argument("--to", help="target status name (fuzzy)")
+    s.add_argument("--id", help="transition id")
+    s.add_argument("--comment", help="posted as a separate call, Markdown or @file.md")
+
+    s = add("comment", cmd_comment, "add a comment (Markdown -> ADF)")
+    s.add_argument("key")
+    s.add_argument("text")
+
+    s = add("comments", cmd_comments, "read comments")
+    s.add_argument("key")
+    s.add_argument("--limit", type=int, default=20)
+
+    s = add("comment-edit", cmd_comment_edit, "rewrite an existing comment")
+    s.add_argument("key"); s.add_argument("id"); s.add_argument("text")
+
+    s = add("comment-rm", cmd_comment_rm, "delete a comment")
+    s.add_argument("key"); s.add_argument("id")
+
+    s = add("assign", cmd_assign, "assign by display name or email")
+    s.add_argument("key")
+    s.add_argument("who")
+
+    s = add("link", cmd_link, "link two work items")
+    s.add_argument("key")
+    s.add_argument("--to", required=True)
+    s.add_argument("--type", default="Relates")
+
+    s = add("delete", cmd_delete, "delete a work item")
+    s.add_argument("key")
+    s.add_argument("--subtasks", action="store_true")
+
+    # worklog
+    wl = add("worklog", None, "worklog operations")
+    wlsub = wl.add_subparsers(dest="wcmd", required=True)
+
+    w = wlsub.add_parser("list"); w.set_defaults(fn=cmd_worklog_list)
+    w.add_argument("key"); w.add_argument("--mine", action="store_true")
+
+    w = wlsub.add_parser("add"); w.set_defaults(fn=cmd_worklog_add)
+    w.add_argument("key"); w.add_argument("time", help="2h30m / 1d / 45m")
+    w.add_argument("--date", help="YYYY-MM-DD (default today)")
+    w.add_argument("--at", default="12:00:00", help="HH:MM:SS start time")
+    w.add_argument("--comment")
+
+    w = wlsub.add_parser("edit"); w.set_defaults(fn=cmd_worklog_edit)
+    w.add_argument("key"); w.add_argument("id")
+    w.add_argument("--time"); w.add_argument("--date")
+    w.add_argument("--at", default="12:00:00"); w.add_argument("--comment")
+
+    w = wlsub.add_parser("rm"); w.set_defaults(fn=cmd_worklog_rm)
+    w.add_argument("key"); w.add_argument("id")
+
+    # attachments
+    s = add("attach", cmd_attach, "upload file(s) to a work item")
+    s.add_argument("key"); s.add_argument("files", nargs="+")
+
+    s = add("attachments", cmd_attachments, "list attachments")
+    s.add_argument("key")
+
+    s = add("attach-rm", cmd_attach_rm, "delete an attachment")
+    s.add_argument("id")
+
+    s = add("download", cmd_download, "download attachments")
+    s.add_argument("key"); s.add_argument("--name", help="filename substring filter")
+    s.add_argument("--dest", default=".")
+
+    # agile / meta
+    s = add("boards", cmd_boards, "list boards"); s.add_argument("--project")
+    s = add("sprints", cmd_sprints, "list sprints of a board")
+    s.add_argument("board"); s.add_argument("--state", help="active|future|closed")
+    sp = add("sprint", None, "sprint operations (write)")
+    spsub = sp.add_subparsers(dest="scmd", required=True)
+
+    c = spsub.add_parser("current"); c.set_defaults(fn=cmd_sprint_current)
+    c.add_argument("board", help="board id")
+
+    c = spsub.add_parser("add"); c.set_defaults(fn=cmd_sprint_add)
+    c.add_argument("sprint", help="sprint id, or 'current' with --board")
+    c.add_argument("keys", nargs="+"); c.add_argument("--board")
+
+    c = spsub.add_parser("backlog"); c.set_defaults(fn=cmd_sprint_backlog)
+    c.add_argument("keys", nargs="+")
+
+    c = spsub.add_parser("issues"); c.set_defaults(fn=cmd_sprint_issues)
+    c.add_argument("sprint"); c.add_argument("--board")
+    c.add_argument("--limit", type=int, default=100)
+
+    c = spsub.add_parser("create"); c.set_defaults(fn=cmd_sprint_create)
+    c.add_argument("--board", required=True); c.add_argument("--name", required=True)
+    c.add_argument("--start"); c.add_argument("--end"); c.add_argument("--goal")
+
+    c = spsub.add_parser("update"); c.set_defaults(fn=cmd_sprint_update)
+    c.add_argument("sprint"); c.add_argument("--name"); c.add_argument("--goal")
+    c.add_argument("--state", help="future|active|closed")
+    c.add_argument("--start"); c.add_argument("--end")
+
+    add("projects", cmd_projects, "list projects")
+    s = add("fields", cmd_fields, "find field ids by name")
+    s.add_argument("query", nargs="?")
+
+    s = add("report", cmd_report, "per-day worklog report (existing script)")
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+
+    # confluence
+    cf = add("conf", None, "Confluence operations")
+    cfsub = cf.add_subparsers(dest="ccmd", required=True)
+
+    c = cfsub.add_parser("get"); c.set_defaults(fn=cmd_conf_get)
+    c.add_argument("id"); c.add_argument("--meta", action="store_true")
+
+    c = cfsub.add_parser("put"); c.set_defaults(fn=cmd_conf_put)
+    c.add_argument("id"); c.add_argument("body", nargs="?", help="file path (or stdin)")
+    c.add_argument("--title"); c.add_argument("--message")
+
+    c = cfsub.add_parser("create"); c.set_defaults(fn=cmd_conf_create)
+    c.add_argument("--space", help="space key"); c.add_argument("--space-id")
+    c.add_argument("--title", required=True)
+    c.add_argument("body", nargs="?", help="file path (or stdin)")
+    c.add_argument("--parent")
+
+    c = cfsub.add_parser("search"); c.set_defaults(fn=cmd_conf_search)
+    c.add_argument("cql"); c.add_argument("--limit", type=int, default=25)
+
+    c = cfsub.add_parser("children"); c.set_defaults(fn=cmd_conf_children)
+    c.add_argument("id")
+
+    c = cfsub.add_parser("spaces"); c.set_defaults(fn=cmd_conf_spaces)
+
+    c = cfsub.add_parser("delete"); c.set_defaults(fn=cmd_conf_delete)
+    c.add_argument("id")
+
+    c = cfsub.add_parser("comments"); c.set_defaults(fn=cmd_conf_comments)
+    c.add_argument("id"); c.add_argument("--limit", type=int, default=50)
+    c.add_argument("--footer-only", action="store_true",
+                   help="skip inline comments")
+
+    c = cfsub.add_parser("comment"); c.set_defaults(fn=cmd_conf_comment)
+    c.add_argument("id"); c.add_argument("text", help="Markdown or @file.md")
+
+    c = cfsub.add_parser("reply"); c.set_defaults(fn=cmd_conf_reply)
+    c.add_argument("comment_id"); c.add_argument("text")
+
+    c = cfsub.add_parser("history"); c.set_defaults(fn=cmd_conf_history)
+    c.add_argument("id"); c.add_argument("--limit", type=int, default=25)
+
+    c = cfsub.add_parser("diff"); c.set_defaults(fn=cmd_conf_diff)
+    c.add_argument("id")
+    c.add_argument("--from", dest="from_", help="older version (default: to-1)")
+    c.add_argument("--to", help="newer version (default: current)")
+    c.add_argument("--context", type=int, default=3)
+
+    c = cfsub.add_parser("labels"); c.set_defaults(fn=cmd_conf_labels)
+    c.add_argument("id")
+
+    c = cfsub.add_parser("label-add"); c.set_defaults(fn=cmd_conf_label_add)
+    c.add_argument("id"); c.add_argument("names", nargs="+")
+
+    c = cfsub.add_parser("attach"); c.set_defaults(fn=cmd_conf_attach)
+    c.add_argument("id"); c.add_argument("files", nargs="+")
+
+    return p
+
+
+def main():
+    argv = sys.argv[1:]
+    a = build_parser().parse_args(argv)
+    if not getattr(a, "fn", None):
+        sys.exit("atl: incomplete command; try --help")
+    # argparse lets the innermost --json (default None) overwrite an outer one.
+    a.json = "--json" in argv
+    try:
+        a.fn(None if a.fn is cmd_init else load_creds(), a)
+    except ApiError as e:
+        body = e.body
+        try:
+            j = json.loads(body)
+            msgs = list(j.get("errorMessages") or [])
+            errs = j.get("errors")
+            if isinstance(errs, dict):
+                msgs += [f"{k}: {v}" for k, v in errs.items()]
+            elif isinstance(errs, list):
+                # Confluence shape: [{"status":404,"title":"Not Found","detail":null}]
+                msgs += [" ".join(str(e.get(k)) for k in ("title", "detail")
+                                  if e.get(k)) if isinstance(e, dict) else str(e)
+                         for e in errs]
+            if j.get("message"):
+                msgs.append(j["message"])
+            body = "; ".join(msgs) or body
+        except ValueError:
+            pass
+        sys.exit(f"atl: HTTP {e.status} — {body}")
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
