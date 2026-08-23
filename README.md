@@ -19,22 +19,62 @@ A drop-in replacement for the [mcp-atlassian](https://github.com/sooperset/mcp-a
 
 ---
 
+## What it looks like
+
+You ask for an issue. You get an issue — seven lines and the description, as plain text:
+
 ```console
-$ atl issue PROJ-1257
-PROJ-1257  Generated API types cannot be regenerated — minified DTO names are unstable
-  status:   In testing   type: Task   prio: Medium
-  assignee: Jane Doe     reporter: Alex M.
-  labels:   backend, frontend, tech-debt
-  time:     spent 30m  est —
-  url:      https://acme.atlassian.net/browse/PROJ-1257
+$ atl issue PROJ-482
+PROJ-482  Checkout fails when the cart holds more than 20 items
+  status:   In Progress   type: Bug   prio: High
+  assignee: Jane Doe      reporter: Sam Patel
+  labels:   checkout, payments
+  time:     spent 3h  est 1d
+  url:      https://acme.atlassian.net/browse/PROJ-482
 
 --- description ---
-## Problem
-`npm run generate:admin` cannot be run. Regenerating the types produces a
-+5295 / −3307 diff and 117 `tsc` errors — not because the API changed …
+## Steps to reproduce
+
+1. Add 21 items to the cart
+2. Go to checkout
+3. The Pay button stays disabled
+
+Server returns 400 with `CART_TOO_LARGE`. The limit is not documented anywhere.
 ```
 
-That is the entire response. The same call through an MCP server returns **56 KB of JSON**, and your model reads every byte.
+**6.9 KB.** Asking an MCP server for that same issue returns **56 KB of JSON** — and your model reads every byte of it before it can say a word about the bug.
+
+<details>
+<summary><b>See what the MCP server sends back instead</b> (one search result row, abridged)</summary>
+
+<br/>
+
+```json
+{
+  "id": "27714",
+  "key": "PROJ-738",
+  "summary": "User message is not delivered to manager …",
+  "status": { "name": "Release branch", "category": "In Progress", "color": "yellow" },
+  "issue_type": { "name": "Bug" },
+  "priority": { "name": "High" },
+  "assignee": {
+    "display_name": "Jane Doe",
+    "name": "Jane Doe",
+    "email": "jane@acme.com",
+    "avatar_url": "https://avatar-management--avatars.us-west-2.prod.public.atl-paas.net/557058:1a2b…/aaaaaaaa-…/48"
+  }
+}
+```
+
+That `avatar_url` is 200 characters. In a twenty-issue search it repeats **twenty times**, for the same person, next to `id`, `self` links and status colours nobody asked for.
+
+`atl` prints the same row as:
+
+```
+PROJ-738   Release branch  Bug   Jane Doe   User message is not delivered to manager …
+```
+
+</details>
 
 <div align="center">
 
@@ -62,27 +102,6 @@ MCP is a fine protocol. For a REST API an agent hits dozens of times a day, it h
     <img alt="Bytes reaching the model per operation: atl vs mcp-atlassian" src="docs/assets/tokens-light.svg" width="100%">
   </picture>
 </div>
-
-The gap is not compression. Here is **one row** of a twenty-row MCP search result:
-
-```json
-{
-  "id": "27714", "key": "PROJ-738",
-  "summary": "User message is not delivered to manager …",
-  "status": { "name": "Release branch", "category": "In Progress", "color": "yellow" },
-  "issue_type": { "name": "Bug" }, "priority": { "name": "High" },
-  "assignee": {
-    "display_name": "Jane Doe", "name": "Jane Doe", "email": "jane@acme.com",
-    "avatar_url": "https://avatar-management--avatars.us-west-2.prod.public.atl-paas.net/557058:1a2b…/aaaaaaaa-…/48"
-  }
-}
-```
-
-That `avatar_url` is 200 characters. It repeats **identically on all twenty rows**, for the same person. `atl` prints one line:
-
-```
-PROJ-738   Release branch  Bug   Jane Doe   User message is not delivered to manager …
-```
 
 With a CLI, `jq`, `grep` and `head` do the filtering in the shell — intermediate JSON never enters the context window at all.
 

@@ -1,53 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="442" viewBox="0 0 880 442" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="474" viewBox="0 0 880 474" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
 <text x="0" y="22" font-size="16" font-weight="600" fill="#e6edf3">Bytes that reach the model, per operation</text>
-<text x="0" y="43" font-size="12.5" fill="#9198a1">Same site, same queries. Lower is better.</text>
-<rect x="190" y="34" width="11" height="11" rx="2.5" fill="#3fb950"/>
-<text x="207" y="44" font-size="12.5" fill="#e6edf3">atl</text>
-<rect x="246" y="34" width="11" height="11" rx="2.5" fill="#f85149"/>
-<text x="263" y="44" font-size="12.5" fill="#e6edf3">mcp-atlassian</text>
-<line x1="0" y1="60" x2="880" y2="60" stroke="#3d444d" stroke-width="1"/>
-<text x="0" y="92" font-size="13" fill="#e6edf3">search, 20 issues</text>
-<text x="0" y="107" font-size="10.5" fill="#9198a1">measured vs MCP</text>
-<rect x="190" y="76" width="125.7" height="15" rx="3" fill="#3fb950"/>
-<text x="324.7" y="88" font-size="11.5" fill="#3fb950" font-weight="600">2.8 KB</text>
-<rect x="190" y="96" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="108" font-size="11.5" fill="#f85149">13.2 KB</text>
-<text x="876" y="96" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">4.6×</text>
-<text x="0" y="138" font-size="13" fill="#e6edf3">view one issue</text>
-<rect x="190" y="122" width="70.9" height="15" rx="3" fill="#3fb950"/>
-<text x="269.9" y="134" font-size="11.5" fill="#3fb950" font-weight="600">6.7 KB</text>
-<rect x="190" y="142" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="154" font-size="11.5" fill="#f85149">55.0 KB</text>
-<text x="876" y="142" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">8.2×</text>
-<text x="0" y="184" font-size="13" fill="#e6edf3">read 5 comments</text>
-<rect x="190" y="168" width="69.3" height="15" rx="3" fill="#3fb950"/>
-<text x="268.3" y="180" font-size="11.5" fill="#3fb950" font-weight="600">5.0 KB</text>
-<rect x="190" y="188" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="200" font-size="11.5" fill="#f85149">41.6 KB</text>
-<text x="876" y="188" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">8.4×</text>
-<text x="0" y="230" font-size="13" fill="#e6edf3">list transitions</text>
-<rect x="190" y="214" width="38.3" height="15" rx="3" fill="#3fb950"/>
-<text x="237.3" y="226" font-size="11.5" fill="#3fb950" font-weight="600">935 B</text>
-<rect x="190" y="234" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="246" font-size="11.5" fill="#f85149">13.9 KB</text>
-<text x="876" y="234" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">15.2×</text>
-<text x="0" y="276" font-size="13" fill="#e6edf3">list worklogs</text>
-<rect x="190" y="260" width="24.5" height="15" rx="3" fill="#3fb950"/>
-<text x="223.5" y="272" font-size="11.5" fill="#3fb950" font-weight="600">139 B</text>
-<rect x="190" y="280" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="292" font-size="11.5" fill="#f85149">3.2 KB</text>
-<text x="876" y="280" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">23.7×</text>
-<text x="0" y="322" font-size="13" fill="#e6edf3">list boards</text>
-<rect x="190" y="306" width="38.2" height="15" rx="3" fill="#3fb950"/>
-<text x="237.2" y="318" font-size="11.5" fill="#3fb950" font-weight="600">816 B</text>
-<rect x="190" y="326" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="338" font-size="11.5" fill="#f85149">12.1 KB</text>
-<text x="876" y="326" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">15.2×</text>
-<text x="0" y="368" font-size="13" fill="#e6edf3">list projects</text>
-<rect x="190" y="352" width="22.9" height="15" rx="3" fill="#3fb950"/>
-<text x="221.9" y="364" font-size="11.5" fill="#3fb950" font-weight="600">1.0 KB</text>
-<rect x="190" y="372" width="582" height="15" rx="3" fill="#f85149"/>
-<text x="781" y="384" font-size="11.5" fill="#f85149">25.9 KB</text>
-<text x="876" y="372" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">25.4×</text>
-<text x="0" y="428" font-size="11" fill="#9198a1">mcp-atlassian 0.21.0 · Jira Cloud · August 2026 · unmeasured rows compare against the raw REST payload (upper bound)</text>
+<text x="0" y="42" font-size="12.5" fill="#9198a1">Same site, same queries. Lower is better.</text>
+<rect x="0" y="56" width="11" height="11" rx="2.5" fill="#3fb950"/>
+<text x="17" y="66" font-size="12.5" fill="#e6edf3">atl</text>
+<rect x="45" y="56" width="11" height="11" rx="2.5" fill="#f85149"/>
+<text x="62" y="66" font-size="12.5" fill="#e6edf3">mcp-atlassian</text>
+<line x1="0" y1="80" x2="880" y2="80" stroke="#3d444d"/>
+<text x="0" y="114" font-size="13" fill="#e6edf3">search, 20 issues</text>
+<text x="0" y="129" font-size="10.5" fill="#9198a1">measured vs MCP</text>
+<rect x="200" y="100" width="122.7" height="15" rx="3" fill="#3fb950"/>
+<text x="331.7" y="112" font-size="11.5" font-weight="600" fill="#3fb950">2.8 KB</text>
+<rect x="200" y="121" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="133" font-size="11.5" fill="#f85149">13.2 KB</text>
+<text x="876" y="120" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">4.6×</text>
+<text x="0" y="162" font-size="13" fill="#e6edf3">view one issue</text>
+<rect x="200" y="148" width="69.2" height="15" rx="3" fill="#3fb950"/>
+<text x="278.2" y="160" font-size="11.5" font-weight="600" fill="#3fb950">6.7 KB</text>
+<rect x="200" y="169" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="181" font-size="11.5" fill="#f85149">55.0 KB</text>
+<text x="876" y="168" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">8.2×</text>
+<text x="0" y="210" font-size="13" fill="#e6edf3">read 5 comments</text>
+<rect x="200" y="196" width="67.6" height="15" rx="3" fill="#3fb950"/>
+<text x="276.6" y="208" font-size="11.5" font-weight="600" fill="#3fb950">5.0 KB</text>
+<rect x="200" y="217" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="229" font-size="11.5" fill="#f85149">41.6 KB</text>
+<text x="876" y="216" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">8.4×</text>
+<text x="0" y="258" font-size="13" fill="#e6edf3">list transitions</text>
+<rect x="200" y="244" width="37.4" height="15" rx="3" fill="#3fb950"/>
+<text x="246.4" y="256" font-size="11.5" font-weight="600" fill="#3fb950">935 B</text>
+<rect x="200" y="265" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="277" font-size="11.5" fill="#f85149">13.9 KB</text>
+<text x="876" y="264" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">15.2×</text>
+<text x="0" y="306" font-size="13" fill="#e6edf3">list worklogs</text>
+<rect x="200" y="292" width="23.9" height="15" rx="3" fill="#3fb950"/>
+<text x="232.9" y="304" font-size="11.5" font-weight="600" fill="#3fb950">139 B</text>
+<rect x="200" y="313" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="325" font-size="11.5" fill="#f85149">3.2 KB</text>
+<text x="876" y="312" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">23.7×</text>
+<text x="0" y="354" font-size="13" fill="#e6edf3">list boards</text>
+<rect x="200" y="340" width="37.3" height="15" rx="3" fill="#3fb950"/>
+<text x="246.3" y="352" font-size="11.5" font-weight="600" fill="#3fb950">816 B</text>
+<rect x="200" y="361" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="373" font-size="11.5" fill="#f85149">12.1 KB</text>
+<text x="876" y="360" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">15.2×</text>
+<text x="0" y="402" font-size="13" fill="#e6edf3">list projects</text>
+<rect x="200" y="388" width="22.4" height="15" rx="3" fill="#3fb950"/>
+<text x="231.4" y="400" font-size="11.5" font-weight="600" fill="#3fb950">1.0 KB</text>
+<rect x="200" y="409" width="568" height="15" rx="3" fill="#f85149"/>
+<text x="777" y="421" font-size="11.5" fill="#f85149">25.9 KB</text>
+<text x="876" y="408" font-size="14" font-weight="700" text-anchor="end" fill="#e6edf3">25.4×</text>
+<text x="0" y="462" font-size="11" fill="#9198a1">mcp-atlassian 0.21.0 · Jira Cloud · August 2026 · unmeasured rows compare against the raw REST payload (upper bound)</text>
 </svg>
