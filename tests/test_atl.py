@@ -350,17 +350,29 @@ class Secrets(unittest.TestCase):
         with open(os.path.join(HERE, os.pardir, "atl")) as f:
             tree = _ast.parse(f.read())
 
+        def subscript_key(node):
+            """The literal key of a subscript, across Python versions.
+
+            Before 3.9 the slice is wrapped in ast.Index; from 3.9 it is the
+            expression itself.
+            """
+            sl = node.slice
+            sl = getattr(sl, "value", sl) if sl.__class__.__name__ == "Index" else sl
+            return sl.value if isinstance(sl, _ast.Constant) else None
+
         readers = set()
         for fn in _ast.walk(tree):
             if not isinstance(fn, _ast.FunctionDef):
                 continue
             for node in _ast.walk(fn):
                 if (isinstance(node, _ast.Subscript)
-                        and isinstance(node.slice, _ast.Constant)
-                        and node.slice.value == "token"
+                        and subscript_key(node) == "token"
                         and isinstance(node.value, _ast.Name)
                         and node.value.id in ("creds", "cfg")):
                     readers.add(fn.name)
+
+        self.assertTrue(readers, "the AST walk found no token reads at all — "
+                                 "the test is broken, not the code")
 
         self.assertEqual(readers, {"_auth_header"},
                          f"token is read outside the auth header: {sorted(readers)}")
