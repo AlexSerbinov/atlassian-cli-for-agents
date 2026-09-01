@@ -806,6 +806,22 @@ BRIEF_FIELDS = "summary,status,assignee,issuetype,priority,parent,duedate,timetr
 TOKEN_URL = "https://id.atlassian.com/manage-profile/security/api-tokens"
 
 
+def _prompt(fn, *args):
+    """Run one interactive prompt. No stdin is a clean error, not a traceback.
+
+    Agent harnesses and CI run commands without a terminal; the first prompt
+    then hits EOF. Say what to do instead of dumping a stack trace.
+    """
+    try:
+        return fn(*args)
+    except EOFError:
+        sys.exit(
+            "atl: init needs an interactive terminal — stdin reached EOF.\n"
+            "  Run `atl init` from a shell, or write " + ATL_CONFIG + " by hand:\n"
+            '  {"url": "https://you.atlassian.net", "user": "you@example.com",\n'
+            '   "token_command": "secret-tool lookup service atl account you@example.com"}')
+
+
 def _keychain_recipe(user):
     """A `token_command` for the OS keychain, if this platform has one."""
     if sys.platform == "darwin":
@@ -835,7 +851,7 @@ def cmd_init(_unused, a):
 
     def ask(prompt, default=""):
         shown = f" [{default}]" if default else ""
-        return input(f"{prompt}{shown}: ").strip() or default
+        return _prompt(input, f"{prompt}{shown}: ").strip() or default
 
     print("atl setup\n")
     print("1. Open " + TOKEN_URL)
@@ -883,7 +899,7 @@ def cmd_init(_unused, a):
         if sys.platform == "darwin":
             print("  (or add it by hand in Keychain Access, service 'atl')")
     else:
-        token = getpass.getpass("API token (input hidden): ").strip()
+        token = _prompt(getpass.getpass, "API token (input hidden): ").strip()
         if not token:
             sys.exit("atl: no token given")
         cfg["token"] = token
