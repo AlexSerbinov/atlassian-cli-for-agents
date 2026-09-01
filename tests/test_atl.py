@@ -621,3 +621,52 @@ class Secrets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class InitWithoutATerminal(unittest.TestCase):
+    """`atl init` prompts. A closed stdin must read as a clean error, not a traceback.
+
+    Agent harnesses (Claude Code's `!` prefix, CI steps, `atl init < /dev/null`)
+    run commands with no interactive stdin. The first prompt then hits EOF.
+    """
+
+    def setUp(self):
+        self._saved_config = atl.ATL_CONFIG
+        self._saved_stdin = sys.stdin
+        self.dir = tempfile.mkdtemp()
+        atl.ATL_CONFIG = os.path.join(self.dir, ".atl.json")
+
+    def tearDown(self):
+        atl.ATL_CONFIG = self._saved_config
+        sys.stdin = self._saved_stdin
+
+    def test_eof_at_a_prompt_becomes_a_clean_exit(self):
+        def closed_stdin():
+            raise EOFError("EOF when reading a line")
+
+        with self.assertRaises(SystemExit) as cm:
+            atl._prompt(closed_stdin)
+        self.assertIn("atl:", str(cm.exception))
+
+    def test_the_clean_exit_names_the_config_file_to_write_by_hand(self):
+        def closed_stdin():
+            raise EOFError("EOF when reading a line")
+
+        with self.assertRaises(SystemExit) as cm:
+            atl._prompt(closed_stdin)
+        self.assertIn(atl.ATL_CONFIG, str(cm.exception))
+
+    def test_init_on_an_empty_stdin_does_not_raise_eoferror(self):
+        import argparse
+        import contextlib
+        import io
+
+        sys.stdin = io.StringIO("")
+        args = argparse.Namespace(force=False, scoped=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                atl.cmd_init(None, args)
+
+    def test_a_prompt_that_answers_returns_the_answer_untouched(self):
+        self.assertEqual(atl._prompt(lambda: "  https://x.atlassian.net  "),
+                         "  https://x.atlassian.net  ")
