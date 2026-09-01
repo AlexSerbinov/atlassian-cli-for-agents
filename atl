@@ -815,11 +815,14 @@ def _prompt(fn, *args):
     try:
         return fn(*args)
     except EOFError:
+        example = "you@example.com"
+        recipe = _keychain_recipe(example)
+        secret = f'"token_command": "{recipe[0]}"' if recipe else '"token": "YOUR_API_TOKEN"'
         sys.exit(
             "atl: init needs an interactive terminal — stdin reached EOF.\n"
             "  Run `atl init` from a shell, or write " + ATL_CONFIG + " by hand:\n"
-            '  {"url": "https://you.atlassian.net", "user": "you@example.com",\n'
-            '   "token_command": "secret-tool lookup service atl account you@example.com"}')
+            f'  {{"url": "https://you.atlassian.net", "user": "{example}",\n'
+            f"   {secret}}}")
 
 
 def _keychain_recipe(user):

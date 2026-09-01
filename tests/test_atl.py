@@ -670,3 +670,33 @@ class InitWithoutATerminal(unittest.TestCase):
     def test_a_prompt_that_answers_returns_the_answer_untouched(self):
         self.assertEqual(atl._prompt(lambda: "  https://x.atlassian.net  "),
                          "  https://x.atlassian.net  ")
+
+    def test_the_clean_exit_suggests_this_platforms_keychain_not_anothers(self):
+        """The hint must fit the machine it prints on.
+
+        A macOS user told to run `secret-tool` (GNOME/libsecret) copies a
+        command their box does not have.
+        """
+        def closed_stdin():
+            raise EOFError("EOF when reading a line")
+
+        with self.assertRaises(SystemExit) as cm:
+            atl._prompt(closed_stdin)
+        message = str(cm.exception)
+        recipe = atl._keychain_recipe("you@example.com")
+        if recipe:
+            self.assertIn(recipe[0], message)
+        else:
+            self.assertIn('"token"', message)
+
+    def test_the_clean_exit_prints_parseable_json(self):
+        def closed_stdin():
+            raise EOFError("EOF when reading a line")
+
+        with self.assertRaises(SystemExit) as cm:
+            atl._prompt(closed_stdin)
+        body = str(cm.exception)
+        blob = body[body.index("{"):body.rindex("}") + 1]
+        parsed = json.loads(blob)
+        self.assertEqual(parsed["url"], "https://you.atlassian.net")
+        self.assertEqual(parsed["user"], "you@example.com")
